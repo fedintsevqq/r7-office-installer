@@ -26,17 +26,67 @@ LICENSE                   GNU GPL v3
 
 ## Быстрый старт
 
-Скачать и запустить — три команды:
+**Положите дистрибутив Р7 (`.deb` или `.rpm`) в папку «Загрузки».** Скрипт скачается туда же — оба файла должны лежать рядом, в одной папке.
+
+Дальше скопируйте блок под свою систему и вставьте в терминал целиком.
+
+**Debian 12**
 
 ```bash
+cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+chmod +x install-r7.sh
+sudo ./install-r7.sh --os debian12 -l
+```
+
+**Debian 13**
+
+```bash
+cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+chmod +x install-r7.sh
+sudo ./install-r7.sh --os debian13 -l
+```
+
+**Astra Linux**
+
+```bash
+cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+chmod +x install-r7.sh
+sudo ./install-r7.sh --os astra -l
+```
+
+**Альт Linux**
+
+```bash
+cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+chmod +x install-r7.sh
+sudo ./install-r7.sh --os alt -l
+```
+
+**РЕД ОС**
+
+```bash
+cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+chmod +x install-r7.sh
+sudo ./install-r7.sh --os redos -l
+```
+
+**Система неизвестна** — уберите `--os`, скрипт определит сам:
+
+```bash
+cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh -l
 ```
 
-Флаг `-l` берёт самый свежий дистрибутив из папки. Уберите его — откроется меню: выберите версию, введите MD5 из документа Word (или нажмите Enter, чтобы пропустить проверку), дальше скрипт всё сделает сам.
+Первая строка переходит в «Загрузки». Флаг `-l` берёт самый свежий пакет из папки; уберите его, чтобы выбрать версию в меню.
 
-Дистрибутив Р7 (`.deb` или `.rpm`) должен лежать рядом со скриптом или в «Загрузках» — скрипт сам его найдёт. Если пакета ещё нет, скачайте его по ссылке:
+Если пакета ещё нет, скачайте его по ссылке:
 
 ```bash
 sudo ./install-r7.sh -u https://ссылка-на-пакет
@@ -48,24 +98,7 @@ sudo ./install-r7.sh -u https://ссылка-на-пакет
 sudo ./install-r7.sh -f -y
 ```
 
-### Если автоопределение ошиблось
-
-Задайте профиль флагом `--os` — `debian12`, `debian13`, `astra`, `alt` или `redos`:
-
-```bash
-sudo ./install-r7.sh --os debian13 -l
-```
-
-То же самое делают обёртки. Они тонкие: вся логика в `install-r7.sh`, поэтому качайте оба файла в одну папку.
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
-curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/update-r7-debian13.sh
-chmod +x install-r7.sh update-r7-debian13.sh
-sudo ./update-r7-debian13.sh -l
-```
-
-Для другой системы поменяйте имя обёртки: `update-r7-debian12.sh`, `update-r7-astra.sh`, `update-r7-alt.sh`, `update-r7-redos.sh`.
+Вместо `--os` можно взять готовую обёртку — `update-r7-debian13.sh` и остальные. Обёртки тонкие: вся логика в `install-r7.sh`, поэтому класть их нужно рядом с ним.
 
 ---
 
