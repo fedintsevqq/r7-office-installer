@@ -4,6 +4,70 @@
 
 ---
 
+## Самый быстрый способ: скачать и запустить
+
+Скрипты лежат на GitHub. Если у вас есть интернет, ничего искать и копировать вручную не надо — три команды в терминале, и всё.
+
+Универсальный скрипт (сам определит вашу систему):
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+chmod +x install-r7.sh
+sudo ./install-r7.sh -l
+```
+
+Флаг `-l` берёт самый свежий дистрибутив из папки. Уберите его, если хотите выбрать версию в меню.
+
+### Если автоопределение ошиблось
+
+Такое бывает на пересобранных образах: система одна, а в `/etc/os-release` написано другое. Тогда возьмите обёртку под свою систему — она сразу задаёт нужный профиль.
+
+Обёртка сама по себе не работает: вся логика лежит в `install-r7.sh`, поэтому качайте оба файла в одну папку.
+
+**Debian 13:**
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/update-r7-debian13.sh
+chmod +x install-r7.sh update-r7-debian13.sh
+sudo ./update-r7-debian13.sh -l
+```
+
+Для остальных систем меняется только имя обёртки:
+
+| Система | Файл |
+|---|---|
+| Debian 12 | `update-r7-debian12.sh` |
+| Debian 13 | `update-r7-debian13.sh` |
+| Astra Linux | `update-r7-astra.sh` |
+| Альт Linux | `update-r7-alt.sh` |
+| РЕД ОС | `update-r7-redos.sh` |
+
+Например, для РЕД ОС:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
+curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/update-r7-redos.sh
+chmod +x install-r7.sh update-r7-redos.sh
+sudo ./update-r7-redos.sh -l
+```
+
+То же самое можно сделать без обёртки — флагом `--os`:
+
+```bash
+sudo ./install-r7.sh --os redos -l
+```
+
+Дистрибутив Р7 (`.deb` или `.rpm`) должен лежать рядом со скриптом или в «Загрузках» — скрипт сам его найдёт. Если пакета ещё нет, скачайте его по ссылке прямо из скрипта:
+
+```bash
+sudo ./install-r7.sh -u https://ссылка-на-пакет
+```
+
+Нет `curl`? Поставьте его: `sudo apt install curl` на Debian, Astra и Альт, `sudo dnf install curl` на РЕД ОС. Либо просто скачайте файл через браузер со страницы проекта.
+
+---
+
 ## Что понадобится
 
 1. Файл дистрибутива Р7-Офис. На Debian и Astra это `.deb`, на Альт и РЕД ОС — `.rpm`.
