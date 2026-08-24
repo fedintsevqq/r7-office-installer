@@ -1,0 +1,10 @@
+# Скрипты запускаются в Linux — переносы строк только LF,
+# иначе bash споткнётся о \r в шебанге.
+* text=auto eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+
+# Бинарники не трогаем
+*.docx binary
+*.deb binary
+*.rpm binary
