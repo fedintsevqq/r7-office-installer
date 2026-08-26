@@ -33,7 +33,7 @@ LICENSE                   GNU GPL v3
 **Debian 12**
 
 ```bash
-cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null
+cd "$(find /home -maxdepth 2 -type d \( -name "Загрузки" -o -name "Downloads" \) -print -quit 2>/dev/null || echo ~)"
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh --os debian12 -l
@@ -42,7 +42,7 @@ sudo ./install-r7.sh --os debian12 -l
 **Debian 13**
 
 ```bash
-cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null
+cd "$(find /home -maxdepth 2 -type d \( -name "Загрузки" -o -name "Downloads" \) -print -quit 2>/dev/null || echo ~)"
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh --os debian13 -l
@@ -51,7 +51,7 @@ sudo ./install-r7.sh --os debian13 -l
 **Astra Linux**
 
 ```bash
-cd /home/*/Загрузки 2>/dev/null || cd /home/*/Downloads 2>/dev/null
+cd "$(find /home -maxdepth 2 -type d \( -name "Загрузки" -o -name "Downloads" \) -print -quit 2>/dev/null || echo ~)"
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh --os astra -l
@@ -60,7 +60,7 @@ sudo ./install-r7.sh --os astra -l
 **Альт Linux**
 
 ```bash
-cd /home/admin/Загрузки 2>/dev/null || cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+cd "$(find /home -maxdepth 2 -type d \( -name "Загрузки" -o -name "Downloads" \) -print -quit 2>/dev/null || echo ~)"
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh --os alt -l
@@ -69,7 +69,7 @@ sudo ./install-r7.sh --os alt -l
 **РЕД ОС**
 
 ```bash
-cd /home/*/Загрузки 2>/dev/null || cd /home/*/Downloads 2>/dev/null
+cd "$(find /home -maxdepth 2 -type d \( -name "Загрузки" -o -name "Downloads" \) -print -quit 2>/dev/null || echo ~)"
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh --os redos -l
@@ -78,7 +78,7 @@ sudo ./install-r7.sh --os redos -l
 **Система неизвестна** — уберите `--os`, скрипт определит сам:
 
 ```bash
-cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+cd "$(find /home -maxdepth 2 -type d \( -name "Загрузки" -o -name "Downloads" \) -print -quit 2>/dev/null || echo ~)"
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh -l
