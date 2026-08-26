@@ -47,6 +47,8 @@ CMD_HEALTH=false
 CMD_REMOVE=false
 CMD_FORCE_OS=""
 CMD_CONFIG=""
+CMD_NO_IDLE=false
+CMD_RESTORE_IDLE=false
 DRY_RUN=false
 ASSUME_YES=false
 NO_COLOR_MODE=false
@@ -65,6 +67,7 @@ CFG_REQUIRE_MD5=""
 CFG_SKIP_RDP=""
 CFG_ENABLE_REPORT=true  # отчёты по умолчанию включены
 CFG_ENABLE_HISTORY=true # история установок по умолчанию включена
+CFG_ENABLE_IDLE_CONTROL=""
 CFG_UPGRADE_URL=""
 
 # ------------------------- БАЗОВЫЙ ВЫВОД ------------------------------------
@@ -106,7 +109,7 @@ init_log() {
 config_key_allowed() {
     case "$1" in
         DOWNLOAD_DIR|LOG_FILE|STATE_DIR|ASSUME_YES|REQUIRE_MD5|\
-        SKIP_RDP|ENABLE_REPORT|ENABLE_HISTORY|UPGRADE_URL) return 0 ;;
+        SKIP_RDP|ENABLE_REPORT|ENABLE_HISTORY|ENABLE_IDLE_CONTROL|UPGRADE_URL) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -151,7 +154,7 @@ load_config() {
         fi
 
         case "$key" in
-            ASSUME_YES|REQUIRE_MD5|SKIP_RDP|ENABLE_REPORT|ENABLE_HISTORY)
+            ASSUME_YES|REQUIRE_MD5|SKIP_RDP|ENABLE_REPORT|ENABLE_HISTORY|ENABLE_IDLE_CONTROL)
                 case "$value" in
                     true|false) printf -v "CFG_$key" '%s' "$value" ;;
                     *) warn "Конфиг $file: $key=$value — ожидалось true/false, пропущено" ;;
@@ -270,6 +273,11 @@ show_help() {
   -y, --yes              Не задавать вопросов (для автоматизации)
       --no-color         Вывод без цветов (для логов и CI)
 
+ПРОСТОЙ ЭКРАНА (для ночных прогонов и soak-тестов):
+      --no-idle          Не трогать засыпание/блокировку экрана
+      --restore-idle     Вручную вернуть настройки экрана (если скрипт
+                         прервали и авто-восстановление не сработало)
+
 ПРИМЕРЫ:
   sudo ./install-r7.sh                                # меню
   sudo ./install-r7.sh -l --md5 a1b2c3d4...           # свежая версия + проверка MD5
@@ -284,6 +292,7 @@ show_help() {
   Лог:       /var/log/r7-update.log
   Состояние: /var/lib/r7-installer/
   Конфиг:    /etc/r7-installer.conf (необязательный, см. README)
+  Простой:   /var/lib/r7-installer/idle-saved.state (временный, до восстановления)
 HELPEOF
 }
 
@@ -304,6 +313,8 @@ parse_args() {
             --remove)       CMD_REMOVE=true; shift ;;
             --os)           CMD_FORCE_OS="${2:-}"; shift 2 ;;
             --config)       CMD_CONFIG="${2:-}"; shift 2 ;;
+            --no-idle)      CMD_NO_IDLE=true; shift ;;
+            --restore-idle) CMD_RESTORE_IDLE=true; shift ;;
             --dir)          DOWNLOAD_DIR="${2:-}"; CMD_DIR_SET=true; shift 2 ;;
             --dry-run)      DRY_RUN=true; shift ;;
             -y|--yes)       ASSUME_YES=true; CMD_YES_SET=true; shift ;;
@@ -1007,6 +1018,224 @@ detect_environment() {
     fi
     echo ""
     return 0
+}
+
+# ============================================================================
+#  ПРОСТОЙ ЭКРАНА: ОТКЛЮЧЕНИЕ НА ВРЕМЯ УСТАНОВКИ
+#
+#  Для ночных прогонов и soak-тестов под Jenkins: если экран гаснет и
+#  блокируется, RDP/VNC-сессия может оборваться раньше, чем скрипт
+#  закончит работу. Отключаем скринсейвер/DPMS/блокировку на время
+#  работы скрипта и возвращаем исходные настройки при выходе — в том
+#  числе по Ctrl+C и по обычному завершению (trap EXIT/INT/TERM).
+#
+#  Все меняющие команды идут через run() — значит, автоматически уважают
+#  --dry-run и пишут себя в LOG_FILE, как и остальной скрипт.
+#  Команды "прочитать текущее состояние" через run() не идут: run()
+#  глотает stdout в лог, а нам нужно значение обратно в переменную.
+# ============================================================================
+
+IDLE_STATE_FILE=""
+IDLE_CONTROL_ACTIVE=false
+
+# XAUTHORITY реального пользователя — лучшая попытка, не гарантия.
+# Скрипт и так строит похожие догадки для DISPLAY в detect_session_type().
+find_xauthority() {
+    if [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then
+        echo "$XAUTHORITY"; return 0
+    fi
+    local c
+    for c in "$USER_HOME/.Xauthority" "/run/user/$REAL_UID/gdm/Xauthority"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    echo "$USER_HOME/.Xauthority"
+}
+
+# Выполнить команду от имени реального пользователя с его графическим
+# окружением — xset/gsettings/xfconf-query от root в чужую X11/Wayland
+# сессию обычно не достучатся без этого.
+run_as_user() {
+    if [ "$(id -u)" -eq 0 ] && [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
+        sudo -u "$REAL_USER" \
+            DISPLAY="${DISPLAY:-:0}" \
+            XAUTHORITY="$(find_xauthority)" \
+            XDG_RUNTIME_DIR="/run/user/$REAL_UID" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$REAL_UID/bus" \
+            "$@"
+    else
+        "$@"
+    fi
+}
+
+# --- X11 (xset): Debian, Astra, Альт/РЕД ОС/РОСА с X11-сессией ---------------
+
+idle_x11_save() {
+    command -v xset >/dev/null 2>&1 || return 1
+    local q; q="$(run_as_user xset q 2>/dev/null)"
+    [ -z "$q" ] && return 1
+    local timeout cycle blanking dpms
+    timeout="$(echo "$q" | awk '/^  timeout:/{print $2; exit}')"
+    cycle="$(echo "$q" | awk '/^  timeout:/{print $4; exit}')"
+    blanking="$(echo "$q" | awk '/prefer blanking:/{print $3; exit}')"
+    dpms="off"; echo "$q" | grep -q "DPMS is Enabled" && dpms="on"
+    printf 'X11_TIMEOUT=%s\nX11_CYCLE=%s\nX11_BLANKING=%s\nX11_DPMS=%s\n' \
+        "${timeout:-0}" "${cycle:-0}" "${blanking:-yes}" "$dpms"
+}
+
+idle_x11_disable() {
+    run run_as_user xset s off
+    run run_as_user xset -dpms
+    run run_as_user xset s noblank
+}
+
+idle_x11_restore() {
+    local timeout="${1:-0}" cycle="${2:-0}" blanking="${3:-yes}" dpms="${4:-on}"
+    run run_as_user xset s "$timeout" "$cycle"
+    if [ "$blanking" = "yes" ]; then run run_as_user xset s blank; else run run_as_user xset s noblank; fi
+    if [ "$dpms" = "on" ]; then run run_as_user xset +dpms; else run run_as_user xset -dpms; fi
+}
+
+# --- GNOME/Wayland (gsettings): Debian 13, РЕД ОС, РОСА ----------------------
+
+idle_gsettings_save() {
+    command -v gsettings >/dev/null 2>&1 || return 1
+    local idle_delay lock_enabled idle_activation
+    idle_delay="$(run_as_user gsettings get org.gnome.desktop.session idle-delay 2>/dev/null | sed -E 's/^uint32 //')"
+    [ -z "$idle_delay" ] && return 1
+    lock_enabled="$(run_as_user gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null)"
+    idle_activation="$(run_as_user gsettings get org.gnome.desktop.screensaver idle-activation-enabled 2>/dev/null)"
+    printf 'GS_IDLE_DELAY=%s\nGS_LOCK_ENABLED=%s\nGS_IDLE_ACTIVATION=%s\n' \
+        "$idle_delay" "${lock_enabled:-true}" "${idle_activation:-true}"
+}
+
+idle_gsettings_disable() {
+    run run_as_user gsettings set org.gnome.desktop.session idle-delay 0
+    run run_as_user gsettings set org.gnome.desktop.screensaver lock-enabled false
+    run run_as_user gsettings set org.gnome.desktop.screensaver idle-activation-enabled false
+}
+
+idle_gsettings_restore() {
+    local idle_delay="${1:-300}" lock_enabled="${2:-true}" idle_activation="${3:-true}"
+    run run_as_user gsettings set org.gnome.desktop.session idle-delay "$idle_delay"
+    run run_as_user gsettings set org.gnome.desktop.screensaver lock-enabled "$lock_enabled"
+    run run_as_user gsettings set org.gnome.desktop.screensaver idle-activation-enabled "$idle_activation"
+}
+
+# --- Xfce (Альт бывает и с Xfce, и с GNOME) — проверяем независимо от SESSION_TYPE
+
+idle_xfce_save() {
+    command -v xfconf-query >/dev/null 2>&1 || return 1
+    local dpms; dpms="$(run_as_user xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled 2>/dev/null)"
+    [ -z "$dpms" ] && return 1
+    printf 'XFCE_DPMS=%s\n' "$dpms"
+}
+
+idle_xfce_disable() {
+    command -v xfconf-query >/dev/null 2>&1 || return 0
+    run run_as_user xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled -s false
+}
+
+idle_xfce_restore() {
+    local dpms="${1:-true}"
+    command -v xfconf-query >/dev/null 2>&1 || return 0
+    run run_as_user xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled -s "$dpms"
+}
+
+# --- Текстовая консоль (без графики) -----------------------------------------
+# setterm не умеет "спросить" текущие значения — восстанавливаем на
+# консольные умолчания Дистрибутивов (10 минут), а не на неизвестный
+# оригинал. Это единственное место, где восстановление не буквальное.
+
+idle_console_save() {
+    command -v setterm >/dev/null 2>&1 || return 1
+    echo "CONSOLE_TOUCHED=yes"
+}
+
+idle_console_disable() {
+    run setterm -blank 0 -powersave off -powerdown 0
+}
+
+idle_console_restore() {
+    run setterm -blank 10 -powersave powerdown -powerdown 10
+}
+
+# --- Оркестрация --------------------------------------------------------------
+
+idle_control_init() {
+    if [ "$CMD_NO_IDLE" = true ]; then
+        log "Управление простоем экрана отключено флагом --no-idle"
+        return 0
+    fi
+    if [ "$CFG_ENABLE_IDLE_CONTROL" = false ]; then
+        log "Управление простоем экрана отключено конфигом (ENABLE_IDLE_CONTROL=false)"
+        return 0
+    fi
+
+    IDLE_STATE_FILE="$STATE_DIR/idle-saved.state"
+    if ! : > "$IDLE_STATE_FILE" 2>/dev/null; then
+        warn "Не удалось сохранить состояние экрана ($IDLE_STATE_FILE недоступен) — пропускаю"
+        return 0
+    fi
+
+    {
+        case "$SESSION_TYPE" in
+            x11)      idle_x11_save ;;
+            wayland)  idle_gsettings_save ;;
+            tty|none) idle_console_save ;;
+        esac
+        idle_xfce_save
+    } >> "$IDLE_STATE_FILE" 2>/dev/null
+
+    case "$SESSION_TYPE" in
+        x11)      idle_x11_disable ;;
+        wayland)  idle_gsettings_disable ;;
+        tty|none) idle_console_disable ;;
+    esac
+    idle_xfce_disable
+
+    IDLE_CONTROL_ACTIVE=true
+    log "Отключено засыпание/блокировка экрана (сессия: $SESSION_TYPE)"
+    info "Экран не будет гаснуть на время работы скрипта (--no-idle — отключить)"
+}
+
+# Прочитать файл состояния и вызвать restore только там, где что-то
+# реально сохранилось (пустая метка = "не пытаться восстанавливать").
+idle_state_restore_from_file() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+
+    local X11_TIMEOUT="" X11_CYCLE="" X11_BLANKING="" X11_DPMS=""
+    local GS_IDLE_DELAY="" GS_LOCK_ENABLED="" GS_IDLE_ACTIVATION=""
+    local XFCE_DPMS="" CONSOLE_TOUCHED=""
+    local key value
+    while IFS='=' read -r key value; do
+        [ -z "$key" ] && continue
+        case "$key" in
+            X11_TIMEOUT|X11_CYCLE|X11_BLANKING|X11_DPMS|\
+            GS_IDLE_DELAY|GS_LOCK_ENABLED|GS_IDLE_ACTIVATION|\
+            XFCE_DPMS|CONSOLE_TOUCHED)
+                printf -v "$key" '%s' "$value" ;;
+        esac
+    done < "$file"
+
+    [ -n "$X11_DPMS" ]       && idle_x11_restore "$X11_TIMEOUT" "$X11_CYCLE" "$X11_BLANKING" "$X11_DPMS"
+    [ -n "$GS_IDLE_DELAY" ]  && idle_gsettings_restore "$GS_IDLE_DELAY" "$GS_LOCK_ENABLED" "$GS_IDLE_ACTIVATION"
+    [ -n "$XFCE_DPMS" ]      && idle_xfce_restore "$XFCE_DPMS"
+    [ "$CONSOLE_TOUCHED" = yes ] && idle_console_restore
+}
+
+idle_control_restore_now() {
+    [ "$IDLE_CONTROL_ACTIVE" = true ] || return 0
+    idle_state_restore_from_file "$IDLE_STATE_FILE"
+    rm -f "$IDLE_STATE_FILE" 2>/dev/null
+    IDLE_CONTROL_ACTIVE=false
+    log "Настройки простоя экрана восстановлены"
+}
+
+# Единая точка выхода: сюда со временем может добраться и другая уборка,
+# не только простой экрана — поэтому не привязываем trap к конкретной фиче.
+on_script_exit() {
+    idle_control_restore_now
 }
 
 # ============================================================================
@@ -1851,6 +2080,15 @@ health_check() {
         x11) ok "X11, DISPLAY=${DISPLAY:-не задан}" ;;
         *)   warn "Графическая сессия не обнаружена ($SESSION_TYPE)" ;;
     esac
+    if [ "$IDLE_CONTROL_ACTIVE" = true ]; then
+        ok "Простой экрана отключён на время работы скрипта"
+    elif [ "$CMD_NO_IDLE" = true ]; then
+        info "  Простой экрана: отключено флагом --no-idle"
+    elif [ "$CFG_ENABLE_IDLE_CONTROL" = false ]; then
+        info "  Простой экрана: отключено конфигом"
+    else
+        info "  Простой экрана: не менялся (нет xset/gsettings/xfconf-query или нет графической сессии)"
+    fi
     echo ""
 
     echo -e "${BOLD}4. Зависимости${NC}"
@@ -2316,6 +2554,13 @@ main() {
     fi
 
     check_root "$@"
+    # Единая точка восстановления (пока — только простой экрана) на любой
+    # выход, включая Ctrl+C: без переисполнения EXIT-ветки после INT/TERM
+    # выход по сигналу не срабатывал бы через обычный trap EXIT.
+    trap 'on_script_exit; exit 130' INT
+    trap 'on_script_exit; exit 143' TERM
+    trap on_script_exit EXIT
+
     load_config
     init_log
     detect_os
@@ -2324,6 +2569,21 @@ main() {
     detect_session_type
 
     [ "$DRY_RUN" = true ] && { echo ""; warn "Режим --dry-run: команды показываются, но не выполняются"; echo ""; }
+
+    if [ "$CMD_RESTORE_IDLE" = true ]; then
+        local f="$STATE_DIR/idle-saved.state"
+        if [ ! -f "$f" ]; then
+            info "Сохранённых настроек экрана не найдено — восстанавливать нечего"
+            exit 0
+        fi
+        idle_state_restore_from_file "$f"
+        rm -f "$f"
+        ok "Настройки простоя/блокировки экрана восстановлены"
+        log "Ручное восстановление простоя экрана (--restore-idle)"
+        exit 0
+    fi
+
+    idle_control_init
 
     # Одиночные операции
     if [ "$CMD_LIST_DEPS" = true ];   then list_dependencies; exit 0; fi
