@@ -1970,15 +1970,26 @@ gui_mode() {
     CMD_GUI=false   # дальше работаем обычным потоком, вывод пойдёт в терминал и лог
     ASSUME_YES=true
 
+    # Файл с кодом возврата: mktemp вместо фиксированного пути в /tmp —
+    # иначе локальный пользователь может подложить туда симлинк заранее.
+    # Автоочистка по trap EXIT, даже если zenity закрыли до конца установки.
+    local rc_file; rc_file="$(mktemp "${STATE_DIR:-/tmp}/r7-gui-rc.XXXXXX" 2>/dev/null || mktemp)"
+    trap 'rm -f "$rc_file"' EXIT
+
+    # В прогресс-бар пускаем только наши статусные строки (✅/⚠️/❌/→) —
+    # иначе сырой вывод apt/dnf мелькает в подписи и ничего не разобрать.
+    # Полный вывод в любом случае уходит в LOG_FILE через run()/run_v().
     (
         install_package "$target" "$md5"
-        echo $? > /tmp/r7-gui-result
-    ) | zenity --progress --pulsate --auto-close --no-cancel \
+        echo $? > "$rc_file"
+    ) 2>&1 | grep --line-buffered -E '✅|⚠|❌|→' | sed -u 's/^/#/' \
+      | zenity --progress --pulsate --auto-close --no-cancel \
                --title="Установка Р7-Офис" --text="Идёт установка, подождите..." \
                --width=460 2>/dev/null
 
-    local rc; rc="$(cat /tmp/r7-gui-result 2>/dev/null)"
-    rm -f /tmp/r7-gui-result
+    local rc; rc="$(cat "$rc_file" 2>/dev/null)"
+    rm -f "$rc_file"
+    trap - EXIT
     if [ "$rc" = "0" ]; then
         zenity --info --width=420 --title="Готово" \
                --text="Р7-Офис установлен.\nВерсия: $(installed_version)" 2>/dev/null
