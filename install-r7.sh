@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  Р7-ОФИС — УНИВЕРСАЛЬНЫЙ УСТАНОВЩИК
-#  Поддержка: Debian 12/13, Astra Linux 1.7+, Альт Linux 10+, РЕД ОС 7.3+
-#  Версия: 2.0
+#  Поддержка: Debian 12/13, Astra Linux 1.7+, Альт Linux 10+/11+,
+#             РЕД ОС 7.3+/8+, РОСА «ХРОМ» 12.4+
+#  Версия: 2.1
 #
 #  Запуск:   sudo ./install-r7.sh            (интерактивное меню)
 #            sudo ./install-r7.sh --help     (все опции)
@@ -10,7 +11,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.1"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -131,7 +132,7 @@ check_root() {
 
 show_help() {
     cat <<'HELPEOF'
-Р7-Офис — универсальный установщик (Debian 12/13, Astra, Альт, РЕД ОС)
+Р7-Офис — универсальный установщик (Debian 12/13, Astra, Альт, РЕД ОС, РОСА)
 
 ИСПОЛЬЗОВАНИЕ:
   sudo ./install-r7.sh [ОПЦИИ]
@@ -159,7 +160,7 @@ show_help() {
 РЕЖИМЫ И ОТЛАДКА:
       --gui              Графический режим (zenity)
       --os ИМЯ           Принудительный профиль ОС:
-                         debian12 | debian13 | astra | alt | redos
+                         debian12 | debian13 | astra | alt | redos | rosa
       --dir ПУТЬ         Папка с пакетами (.deb/.rpm)
       --dry-run          Показать команды, ничего не устанавливая
   -y, --yes              Не задавать вопросов (для автоматизации)
@@ -212,7 +213,7 @@ parse_args() {
 
 # ============================================================================
 #  ОПРЕДЕЛЕНИЕ ОС
-#  Заполняет: OS_ID (debian12|debian13|astra|alt|redos), OS_PRETTY, OS_VER,
+#  Заполняет: OS_ID (debian12|debian13|astra|alt|redos|rosa), OS_PRETTY, OS_VER,
 #             PKG_FMT (deb|rpm), PM (apt|apt-rpm|dnf), FEAT_*
 # ============================================================================
 
@@ -239,7 +240,7 @@ detect_os() {
 
     if [ -n "$CMD_FORCE_OS" ]; then
         case "$CMD_FORCE_OS" in
-            debian12|debian13|astra|alt|redos) OS_ID="$CMD_FORCE_OS" ;;
+            debian12|debian13|astra|alt|redos|rosa) OS_ID="$CMD_FORCE_OS" ;;
             *) echo "Неизвестный профиль ОС: $CMD_FORCE_OS"; exit 2 ;;
         esac
         OS_PRETTY="${pretty:-$CMD_FORCE_OS} (профиль задан вручную)"
@@ -261,6 +262,12 @@ detect_os() {
         OS_VER="$(head -1 /etc/astra_version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)"
         [ -z "$OS_VER" ] && OS_VER="$ver"
         OS_PRETTY="${pretty:-Astra Linux} $OS_VER"
+    elif [ -f /etc/rosa-release ] || [ "$id" = "rosa" ]; then
+        OS_ID="rosa"
+        OS_PRETTY="$(head -1 /etc/rosa-release 2>/dev/null)"
+        [ -z "$OS_PRETTY" ] && OS_PRETTY="${pretty:-ROSA Linux}"
+        OS_VER="$ver"
+        [ -z "$OS_VER" ] && OS_VER="$(echo "$OS_PRETTY" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
     elif [ "$id" = "debian" ] || [ -f /etc/debian_version ]; then
         local dver="$ver"
         if [ -z "$dver" ] && [ -r /etc/debian_version ]; then
@@ -279,7 +286,7 @@ detect_os() {
     case "$OS_ID" in
         debian12|debian13|astra) PKG_FMT="deb"; PM="apt" ;;
         alt)                     PKG_FMT="rpm"; PM="apt-rpm" ;;
-        redos)
+        redos|rosa)
             PKG_FMT="rpm"; PM="dnf"
             command -v dnf >/dev/null 2>&1 || PM="yum"
             ;;
@@ -302,7 +309,7 @@ detect_os() {
 
     if [ -z "$PKG_FMT" ]; then
         echo "Не удалось определить ОС и пакетный менеджер."
-        echo "Укажите профиль вручную: $SCRIPT_NAME --os debian13|debian12|astra|alt|redos"
+        echo "Укажите профиль вручную: $SCRIPT_NAME --os debian13|debian12|astra|alt|redos|rosa"
         exit 1
     fi
 
@@ -316,6 +323,7 @@ check_os_version() {
         astra)    minver="1.7"; name="Astra Linux" ;;
         alt)      minver="10";  name="Альт Linux" ;;
         redos)    minver="7.3"; name="РЕД ОС" ;;
+        rosa)     minver="12.4"; name="РОСА «Хром»" ;;
         debian12) minver="12";  name="Debian" ;;
         debian13) minver="13";  name="Debian" ;;
     esac
@@ -543,6 +551,37 @@ opt|libgst-plugins1.0 gst-plugins1.0
 opt|gst-plugins-good1.0
 opt|gst-plugins-ugly1.0
 opt|gst-libav1.0
+opt|zenity
+SPEC
+        elif [ "$OS_ID" = "rosa" ]; then
+            # РОСА «ХРОМ» — наследует именование пакетов Mandriva/ALT:
+            # lib64<имя><soname>_<версия> вместо libимя.so.версия.
+            cat <<'SPEC'
+req|glibc
+req|lib64stdc++6 libstdc++
+req|lib64gcc1 lib64gcc libgcc
+req|lib64cairo lib64cairo2 cairo
+req|lib64gtk+2.0_0 lib64gtk+2_0 gtk2
+req|lib64x11_6 libX11
+req|lib64xscrnsaver1 libXScrnSaver
+req|lib64nss3 nss
+req|lib64nspr4 nspr
+req|lib64dbus-glib-1_2 dbus-glib
+req|lib64asound2 alsa-lib
+req|xdg-utils
+opt|lib64curl4 curl
+opt|lib64atk1.0_0 atk
+opt|lib64gbm1 mesa-libgbm
+opt|lib64xkbcommon0 libxkbcommon
+opt|lib64secret-1_0 libsecret
+opt|lib64gconf-2_4 GConf2
+opt|fonts-ttf-liberation
+opt|fonts-ttf-dejavu
+opt|fonts-ttf-google-crosextra-carlito
+opt|gstreamer1-plugins-base
+opt|gstreamer1-plugins-good
+opt|gstreamer1-plugins-ugly-free gstreamer1-plugins-ugly
+opt|gstreamer1-libav
 opt|zenity
 SPEC
         else
@@ -876,9 +915,10 @@ R7_WRAPPER="/usr/local/bin/r7-office-x11"
 
 wayland_pkg_alts() {
     case "$OS_ID" in
-        alt)   echo "xorg-server-xwayland xwayland xorg-xwayland" ;;
-        redos) echo "xorg-x11-server-Xwayland xwayland" ;;
-        *)     echo "xwayland xwayland-run" ;;
+        alt)        echo "xorg-server-xwayland xwayland xorg-xwayland" ;;
+        redos)      echo "xorg-x11-server-Xwayland xwayland" ;;
+        rosa)       echo "xorg-x11-server-Xwayland xwayland" ;;
+        *)          echo "xwayland xwayland-run" ;;
     esac
 }
 
@@ -1348,6 +1388,60 @@ show_package_info() {
 }
 
 # ============================================================================
+#  СООТВЕТСТВИЕ СБОРКИ ПАКЕТА И ОС
+#
+#  Р7 собирает отдельные .rpm под каждую RPM-систему — имя пакета выглядит
+#  одинаково (r7-office-ВЕРСИЯ.ТЕГ.x86_64.rpm), но ТЕГ выдаёт, под какую
+#  систему собраны зависимости:
+#    .p8 / .p9 / .p10 / .p11   — Альт Linux
+#    .r8 / .r9                 — РОСА (имена библиотек как в Альте: lib64*)
+#    .el7 / .el8                — РЕД ОС (обычные имена: glibc, gtk3, libX11)
+#    ~astra[-signed]            — Astra Linux (.deb)
+#  Если поставить "не свой" .rpm, пакетный менеджер упрётся в зависимости
+#  вида "nothing provides lib64gtk+2.0_0" — это не сломанный репозиторий,
+#  а просто пакет от другой ОС.
+# ============================================================================
+
+detect_build_tag() {
+    local name; name="$(basename "$1")"
+    case "$name" in
+        *~astra*)                          echo "astra" ;;
+        *.p[0-9]*.x86_64.rpm)              echo "alt" ;;
+        *.r[0-9]*.x86_64.rpm)              echo "rosa" ;;
+        *.el[0-9]*.x86_64.rpm)             echo "redos" ;;
+        *~stretch*|*~bookworm*|*~trixie*)  echo "debian" ;;
+        *)                                  echo "" ;;
+    esac
+}
+
+check_package_os_match() {
+    local file="$1" tag; tag="$(detect_build_tag "$file")"
+    [ -z "$tag" ] && return 0
+
+    local expect=""
+    case "$OS_ID" in
+        alt)                expect="alt" ;;
+        rosa)               expect="rosa" ;;
+        redos)              expect="redos" ;;
+        astra)              expect="astra" ;;
+        debian12|debian13)  expect="debian" ;;
+    esac
+
+    [ -z "$expect" ] || [ "$tag" = "$expect" ] && return 0
+
+    echo ""
+    warn "Похоже, пакет собран не под эту ОС."
+    echo -e "  ${CYAN}Файл:${NC}            $(basename "$file")"
+    echo -e "  ${CYAN}Сборка похожа на:${NC} $tag"
+    echo -e "  ${CYAN}Текущая система:${NC}  $OS_ID ($OS_PRETTY)"
+    echo -e "  ${CYAN}Установка чужой сборки обычно падает на зависимостях${NC}"
+    echo -e "  ${CYAN}(\"nothing provides ...\"). Скачайте .rpm/.deb для этой ОС.${NC}"
+    echo ""
+    log "Несовпадение сборки пакета: файл похож на «$tag», ОС «$OS_ID» ($(basename "$file"))"
+    confirm "Всё равно продолжить?" "N"
+}
+
+# ============================================================================
 #  УСТАНОВКА ПАКЕТА
 # ============================================================================
 
@@ -1362,6 +1456,11 @@ install_package() {
 
     if [ ! -f "$file" ]; then
         fail "Файл не найден: $file"
+        return 1
+    fi
+
+    if ! check_package_os_match "$file"; then
+        info "Отменено пользователем"
         return 1
     fi
 
