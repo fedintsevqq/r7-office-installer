@@ -50,6 +50,7 @@ CMD_CONFIG=""
 CMD_NO_IDLE=false
 CMD_RESTORE_IDLE=false
 CMD_VERIFY=false
+CMD_CHECK_DEPS=false
 CMD_HISTORY=false
 CMD_HISTORY_N=10
 CMD_REPORT=false
@@ -263,6 +264,8 @@ show_help() {
 
 ЗАВИСИМОСТИ И ДИАГНОСТИКА:
       --list-deps        Показать список зависимостей для текущей ОС
+      --check-deps       То же, но с версиями: установлена/в репозитории/
+                         вердикт (не подключает сторонние репозитории)
       --install-deps     Только установить зависимости, без установки Р7
       --health           Диагностика системы (health-check)
       --verify           Smoke-тест: реально ли соберутся зависимости
@@ -322,6 +325,7 @@ parse_args() {
             --fix-wayland)  CMD_FIX_WAYLAND=true; shift ;;
             --health)       CMD_HEALTH=true; shift ;;
             --verify)       CMD_VERIFY=true; shift ;;
+            --check-deps)   CMD_CHECK_DEPS=true; shift ;;
             --history)
                 CMD_HISTORY=true
                 case "${2:-}" in
@@ -792,6 +796,147 @@ list_dependencies() {
     separator
     echo -e "${CYAN}Пакетный менеджер:${NC} $PM    ${CYAN}Формат:${NC} $PKG_FMT"
     separator
+}
+
+# ============================================================================
+#  --check-deps: ДИАГНОСТИКА ВЕРСИЙ (НЕ авторезолвер)
+#
+#  В отличие от list_dependencies() (стоит/не стоит), здесь ещё и версии:
+#  что установлено против того, что предлагает репозиторий. Никаких
+#  сторонних репозиториев мы не подключаем и не предлагаем подключить —
+#  РЕД ОС ФСТЭК и Astra ЗПС/МКЦ это сертифицированные конфигурации,
+#  посторонний репозиторий может вывести систему из сертифицированного
+#  состояния. Максимум — назвать пакет.
+# ============================================================================
+
+pkg_installed_version() {
+    local p="$1"
+    case "$PKG_FMT" in
+        deb) dpkg-query -W -f='${Version}' "$p" 2>/dev/null ;;
+        rpm) rpm -q --qf '%{VERSION}-%{RELEASE}' "$p" 2>/dev/null ;;
+    esac
+}
+
+# Версия-кандидат из репозитория. Лучшая попытка — форматы вывода
+# apt-cache/dnf/yum не так стабильны, как хотелось бы; при неопределённости
+# честно возвращаем пусто, а не гадаем.
+pkg_candidate_version() {
+    local p="$1"
+    case "$PM" in
+        apt|apt-rpm)
+            apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/{print $2}'
+            ;;
+        dnf)
+            dnf -q list available "$p" 2>/dev/null | awk 'NR==2{print $2}'
+            ;;
+        yum)
+            yum -q list available "$p" 2>/dev/null | awk 'NR==2{print $2}'
+            ;;
+    esac
+}
+
+check_dependencies_versions() {
+    header
+    separator
+    echo -e "${BOLD}${WHITE}  ПРОВЕРКА ВЕРСИЙ ЗАВИСИМОСТЕЙ — $OS_PRETTY${NC}"
+    separator
+    echo ""
+    pm_update
+
+    local kind alts chosen installed candidate cur cmp
+    local n_ok=0 n_old=0 n_norepo=0 n_missing=0
+    local html_rows=""
+
+    while IFS='|' read -r kind alts; do
+        [ -z "$kind" ] && continue
+        chosen="$(pkg_pick "$alts")"
+
+        if [ -z "$chosen" ]; then
+            if [ "$kind" = "req" ]; then
+                n_missing=$((n_missing + 1))
+                echo -e "  ${RED}[НЕ НАЙДЕН]${NC}         $alts"
+                html_rows="${html_rows}<tr><td>$(html_escape "$alts")</td><td>—</td><td>—</td><td class=\"miss\">не найден ни локально, ни в репо</td></tr>"
+            else
+                n_norepo=$((n_norepo + 1))
+                echo -e "  ${CYAN}[нет, не критично]${NC}  $alts"
+                html_rows="${html_rows}<tr><td>$(html_escape "$alts")</td><td>—</td><td>—</td><td>нет (необязательная)</td></tr>"
+            fi
+            continue
+        fi
+
+        installed="$(pkg_installed_version "$chosen")"
+        candidate="$(pkg_candidate_version "$chosen")"
+
+        if [ -z "$installed" ] && [ -z "$candidate" ]; then
+            n_missing=$((n_missing + 1))
+            echo -e "  ${RED}[НЕДОСТУПЕН]${NC}        $chosen"
+            html_rows="${html_rows}<tr><td>$(html_escape "$chosen")</td><td>—</td><td>—</td><td class=\"miss\">недоступен</td></tr>"
+        elif [ -z "$installed" ]; then
+            n_missing=$((n_missing + 1))
+            echo -e "  ${YELLOW}[НЕ УСТАНОВЛЕН]${NC}     $chosen  (в репозитории: $candidate)"
+            html_rows="${html_rows}<tr><td>$(html_escape "$chosen")</td><td>—</td><td>$(html_escape "$candidate")</td><td class=\"miss\">не установлен</td></tr>"
+        elif [ -z "$candidate" ]; then
+            n_norepo=$((n_norepo + 1))
+            echo -e "  ${CYAN}[БЕЗ ДАННЫХ О РЕПО]${NC} $chosen  (установлена: $installed)"
+            html_rows="${html_rows}<tr><td>$(html_escape "$chosen")</td><td>$(html_escape "$installed")</td><td>—</td><td>без данных о репозитории</td></tr>"
+        elif [ "$installed" = "$candidate" ]; then
+            n_ok=$((n_ok + 1))
+            echo -e "  ${GREEN}[АКТУАЛЬНА]${NC}         $chosen  $installed"
+            html_rows="${html_rows}<tr><td>$(html_escape "$chosen")</td><td>$(html_escape "$installed")</td><td>$(html_escape "$candidate")</td><td class=\"ok\">актуальна</td></tr>"
+        else
+            cur="$(echo "$installed" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)"
+            cmp="$(echo "$candidate" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)"
+            if [ -n "$cur" ] && [ -n "$cmp" ] && ver_ge "$cur" "$cmp"; then
+                n_ok=$((n_ok + 1))
+                echo -e "  ${GREEN}[НОВЕЕ РЕПО]${NC}        $chosen  $installed (репо: $candidate)"
+                html_rows="${html_rows}<tr><td>$(html_escape "$chosen")</td><td>$(html_escape "$installed")</td><td>$(html_escape "$candidate")</td><td class=\"ok\">новее репозитория</td></tr>"
+            else
+                n_old=$((n_old + 1))
+                echo -e "  ${YELLOW}[УСТАРЕЛА]${NC}          $chosen  $installed → $candidate"
+                html_rows="${html_rows}<tr><td>$(html_escape "$chosen")</td><td>$(html_escape "$installed")</td><td>$(html_escape "$candidate")</td><td class=\"miss\">устарела</td></tr>"
+            fi
+        fi
+    done < <(dep_spec)
+
+    echo ""
+    separator
+    echo -e "${CYAN}Актуальных:${NC} $n_ok   ${CYAN}Устаревших:${NC} $n_old   ${CYAN}Без данных о репо:${NC} $n_norepo   ${CYAN}Отсутствуют:${NC} $n_missing"
+    separator
+    log "Проверка версий зависимостей: актуально=$n_ok устарело=$n_old без-репо=$n_norepo нет=$n_missing"
+
+    [ "$CFG_ENABLE_REPORT" = false ] && return 0
+    local dir; dir="$(reports_dir)"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    local stamp; stamp="$(date '+%Y%m%d_%H%M%S')"
+    local html_file="$dir/checkdeps-${stamp}.html"
+    local ts; ts="$(date -Iseconds 2>/dev/null)"; [ -z "$ts" ] && ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+    cat > "$html_file" <<HTMLEOF
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Р7-Офис — версии зависимостей ${stamp}</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#f5f7fa;color:#22252a;margin:0;padding:24px}
+  .card{max-width:820px;margin:0 auto;background:#fff;border-radius:12px;padding:24px 28px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  h1{font-size:20px;margin:0 0 4px}
+  table{width:100%;border-collapse:collapse;margin:8px 0 20px;font-size:14px}
+  td,th{padding:5px 8px;border-bottom:1px solid #eee;text-align:left}
+  td.ok{color:#2e7d32}
+  td.miss{color:#c62828}
+  .meta{color:#616161;font-size:13px}
+</style></head>
+<body><div class="card">
+  <h1>Р7-Офис — версии зависимостей</h1>
+  <p class="meta">${ts} · $(html_escape "$OS_PRETTY") · актуально: ${n_ok}, устарело: ${n_old}, без данных: ${n_norepo}, отсутствует: ${n_missing}</p>
+  <table>
+    <tr><th>Пакет</th><th>Установлена</th><th>В репозитории</th><th>Вердикт</th></tr>
+    ${html_rows}
+  </table>
+</div></body></html>
+HTMLEOF
+
+    log "Отчёт сохранён: $html_file"
+    echo -e "${CYAN}📊 Отчёт сохранён:${NC} $html_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -3067,6 +3212,7 @@ main() {
 
     # Одиночные операции
     if [ "$CMD_LIST_DEPS" = true ];   then list_dependencies; exit 0; fi
+    if [ "$CMD_CHECK_DEPS" = true ];  then check_dependencies_versions; exit 0; fi
     if [ "$CMD_HEALTH" = true ];      then detect_environment >/dev/null; health_check; exit 0; fi
     if [ "$CMD_VERIFY" = true ]; then
         if ! pkg_installed "$PKG_NAME"; then
