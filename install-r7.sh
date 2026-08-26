@@ -215,11 +215,52 @@ confirm() {
     [[ "$answer" =~ ^[YyДд] ]]
 }
 
+# ------------------------- СПИННЕР ДЛЯ ТИХИХ КОМАНД -------------------------
+# Только для run() — там, где вывод команды спрятан в лог и скрипт иначе
+# выглядит зависшим (makecache и подобное). run_v() не трогаем: у него
+# уже есть свой видимый вывод через tee.
+#
+# pv намеренно не используем: его нет по умолчанию ни на одной из шести ОС,
+# а dpkg -i через pv не прогонишь — dpkg не читает пакет со stdin. apt и dnf
+# и так рисуют собственный прогресс поверх run_v().
+SPINNER_PID=""
+
+spinner_start() {
+    (
+        local chars='|/-\' i=0
+        while :; do
+            i=$(( (i + 1) % 4 ))
+            printf '\r  %s %.60s' "${chars:$i:1}" "$1"
+            sleep 0.15
+        done
+    ) &
+    SPINNER_PID=$!
+    disown "$SPINNER_PID" 2>/dev/null
+}
+
+spinner_stop() {
+    [ -n "$SPINNER_PID" ] || return 0
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
+    printf '\r%*s\r' 70 ""
+    SPINNER_PID=""
+}
+
 # Выполнить команду: тихо в лог
 run() {
     log "CMD: $*"
     if [ "$DRY_RUN" = true ]; then echo -e "  ${MAGENTA}[dry-run]${NC} $*"; return 0; fi
+
+    local with_spinner=false
+    if [ -t 1 ] && [ "$NO_COLOR_MODE" != true ] && [ "$CMD_GUI" != true ]; then
+        with_spinner=true
+        spinner_start "$*"
+    fi
+
     "$@" >>"$LOG_FILE" 2>&1
+    local rc=$?
+    [ "$with_spinner" = true ] && spinner_stop
+    return $rc
 }
 
 # Выполнить команду: вывод на экран и в лог, код возврата — самой команды
@@ -1406,6 +1447,7 @@ idle_control_restore_now() {
 # Единая точка выхода: сюда со временем может добраться и другая уборка,
 # не только простой экрана — поэтому не привязываем trap к конкретной фиче.
 on_script_exit() {
+    spinner_stop 2>/dev/null
     idle_control_restore_now
 }
 
