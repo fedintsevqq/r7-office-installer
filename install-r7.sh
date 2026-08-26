@@ -49,6 +49,7 @@ CMD_FORCE_OS=""
 CMD_CONFIG=""
 CMD_NO_IDLE=false
 CMD_RESTORE_IDLE=false
+CMD_VERIFY=false
 DRY_RUN=false
 ASSUME_YES=false
 NO_COLOR_MODE=false
@@ -260,6 +261,8 @@ show_help() {
       --list-deps        Показать список зависимостей для текущей ОС
       --install-deps     Только установить зависимости, без установки Р7
       --health           Диагностика системы (health-check)
+      --verify           Smoke-тест: реально ли соберутся зависимости
+                         бинарника (ldd), без переустановки
       --fix-wayland      Исправить проблемы запуска под Wayland (Debian 13 и др.)
       --remove           Меню удаления Р7-Офис
 
@@ -310,6 +313,7 @@ parse_args() {
             --install-deps) CMD_INSTALL_DEPS=true; shift ;;
             --fix-wayland)  CMD_FIX_WAYLAND=true; shift ;;
             --health)       CMD_HEALTH=true; shift ;;
+            --verify)       CMD_VERIFY=true; shift ;;
             --remove)       CMD_REMOVE=true; shift ;;
             --os)           CMD_FORCE_OS="${2:-}"; shift 2 ;;
             --config)       CMD_CONFIG="${2:-}"; shift 2 ;;
@@ -1287,6 +1291,59 @@ find_r7_binary() {
     return 1
 }
 
+# Найти именно ELF-бинарник DesktopEditors (не обёртку /usr/bin/r7-office).
+# Р7 построен на Qt/CEF и таскает свои .so рядом с самим бинарником —
+# ldd на скрипте-обёртке бессмысленен, а без LD_LIBRARY_PATH на каталог
+# бинарника даёт ложные "not found" на библиотеках, которые лежат тут же.
+find_r7_elf() {
+    local c
+    for c in /opt/r7-office/desktopeditors/DesktopEditors \
+             /opt/r7-office/editors/DesktopEditors \
+             /opt/r7-office/DesktopEditors; do
+        [ -x "$c" ] && { echo "$c"; return 0; }
+    done
+    find_r7_binary
+}
+
+# ============================================================================
+#  SMOKE-ТЕСТ: РЕАЛЬНО ЛИ СОБЕРУТСЯ ЗАВИСИМОСТИ БИНАРНИКА
+# ============================================================================
+
+LDD_STATUS=""   # "" | passed | failed | skipped — читают история и отчёт
+
+smoke_test_ldd() {
+    local bin; bin="$(find_r7_elf)"
+    if [ -z "$bin" ]; then
+        LDD_STATUS="skipped"
+        warn "Исполняемый файл Р7-Офис не найден — smoke-тест пропущен"
+        return 1
+    fi
+    if ! command -v ldd >/dev/null 2>&1; then
+        LDD_STATUS="skipped"
+        info "  ldd не установлен — smoke-тест пропущен"
+        return 0
+    fi
+
+    step "Smoke-тест: проверяем зависимости $(basename "$bin")..."
+    local libdir out missing
+    libdir="$(dirname "$bin")"
+    out="$(LD_LIBRARY_PATH="$libdir:${LD_LIBRARY_PATH:-}" ldd "$bin" 2>&1)"
+    missing="$(echo "$out" | grep "not found" || true)"
+
+    if [ -z "$missing" ]; then
+        LDD_STATUS="passed"
+        ok "Smoke-тест пройден: все зависимости бинарника на месте"
+        log "Smoke-тест (ldd) пройден: $bin"
+        return 0
+    fi
+
+    LDD_STATUS="failed"
+    fail "Smoke-тест: не хватает библиотек рядом с $(basename "$bin")"
+    echo "$missing" | sed 's/^/     /'
+    log "Smoke-тест (ldd) провален для $bin: $(echo "$missing" | tr '\n' ';' | sed 's/;/; /g')"
+    return 1
+}
+
 # Найти .desktop файл Р7-Офис
 find_r7_desktop() {
     local d
@@ -1890,6 +1947,9 @@ post_install_actions() {
     optimize_rdp
 
     echo ""
+    smoke_test_ldd
+
+    echo ""
     local bin; bin="$(find_r7_binary)"
     if [ "$SESSION_TYPE" = "wayland" ] && [ -x "$R7_WRAPPER" ]; then
         ok "Запуск: ${BOLD}$R7_WRAPPER${NC} (или ярлык в меню приложений)"
@@ -2063,6 +2123,7 @@ health_check() {
         [ -n "$bin" ] && ok "Исполняемый файл: $bin" || warn "Исполняемый файл не найден"
         local dsk; dsk="$(find_r7_desktop)"
         [ -n "$dsk" ] && ok "Ярлык: $dsk" || warn "Ярлык в меню приложений не найден"
+        smoke_test_ldd
     else
         fail "Не установлен"
     fi
@@ -2588,6 +2649,14 @@ main() {
     # Одиночные операции
     if [ "$CMD_LIST_DEPS" = true ];   then list_dependencies; exit 0; fi
     if [ "$CMD_HEALTH" = true ];      then detect_environment >/dev/null; health_check; exit 0; fi
+    if [ "$CMD_VERIFY" = true ]; then
+        if ! pkg_installed "$PKG_NAME"; then
+            fail "Р7-Офис не установлен — проверять нечего"
+            exit 1
+        fi
+        smoke_test_ldd
+        exit $?
+    fi
     if [ "$CMD_FIX_WAYLAND" = true ]; then fix_wayland; exit $?; fi
     if [ "$CMD_REMOVE" = true ];      then remove_r7_office; exit 0; fi
     if [ "$CMD_INSTALL_DEPS" = true ]; then
