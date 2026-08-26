@@ -91,7 +91,7 @@ sudo ./install-r7.sh --os redos -l
 Новая поддержка. РОСА собирает Р7 в традициях Mandriva/Альта — имена библиотек с префиксом `lib64` и суффиксом версии (`lib64gtk+2.0_0`, `lib64x11_6`). Менеджер — dnf.
 
 ```bash
-cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
+cd "$(find /home -maxdepth 2 -type d \( -name "Загрузки" -o -name "Downloads" \) -print -quit 2>/dev/null || echo ~)"
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh --os rosa -l
