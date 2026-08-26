@@ -46,9 +46,26 @@ CMD_FIX_WAYLAND=false
 CMD_HEALTH=false
 CMD_REMOVE=false
 CMD_FORCE_OS=""
+CMD_CONFIG=""
 DRY_RUN=false
 ASSUME_YES=false
 NO_COLOR_MODE=false
+CMD_YES_SET=false      # -y передали явно в CLI — конфиг не имеет права его выключить
+CMD_DIR_SET=false      # --dir передали явно в CLI — конфиг не переопределяет папку
+
+# ------------------------- КОНФИГ-ФАЙЛ (можно переопределить) ---------------
+# Приоритет источников: аргументы CLI > переменные окружения > /etc/r7-installer.conf > умолчания.
+CONFIG_FILE_DEFAULT="/etc/r7-installer.conf"
+CONFIG_LOADED=""        # путь к реально подхваченному конфигу (для --health)
+CFG_DOWNLOAD_DIR=""
+CFG_LOG_FILE=""
+CFG_STATE_DIR=""
+CFG_ASSUME_YES=""
+CFG_REQUIRE_MD5=""
+CFG_SKIP_RDP=""
+CFG_ENABLE_REPORT=true  # отчёты по умолчанию включены
+CFG_ENABLE_HISTORY=true # история установок по умолчанию включена
+CFG_UPGRADE_URL=""
 
 # ------------------------- БАЗОВЫЙ ВЫВОД ------------------------------------
 separator() { echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"; }
@@ -74,6 +91,92 @@ init_log() {
     mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR="/tmp/r7-installer"
     mkdir -p "$STATE_DIR" 2>/dev/null
     log "=== Запуск $SCRIPT_NAME v$SCRIPT_VERSION ==="
+}
+
+# ============================================================================
+#  КОНФИГ-ФАЙЛ /etc/r7-installer.conf
+#
+#  Специально не через `source` — конфиг лежит в /etc и его может подложить
+#  кто угодно с доступом на запись туда; `source` выполнил бы произвольный
+#  bash-код от root. Вместо этого — построчный разбор по белому списку ключей,
+#  без eval и без интерпретации значений как кода.
+# ============================================================================
+
+# Разрешённые ключи конфига (значение — не используется, только сам факт наличия)
+config_key_allowed() {
+    case "$1" in
+        DOWNLOAD_DIR|LOG_FILE|STATE_DIR|ASSUME_YES|REQUIRE_MD5|\
+        SKIP_RDP|ENABLE_REPORT|ENABLE_HISTORY|UPGRADE_URL) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+load_config() {
+    local file="${CMD_CONFIG:-$CONFIG_FILE_DEFAULT}"
+    [ -f "$file" ] || { [ -n "$CMD_CONFIG" ] && warn "Конфиг не найден: $file"; return 0; }
+
+    # Владелец должен быть root, права — не шире 644 (нет записи для группы/остальных).
+    local owner mode
+    owner="$(stat -c '%u' "$file" 2>/dev/null)"
+    mode="$(stat -c '%a' "$file" 2>/dev/null)"
+    if [ "$owner" != "0" ]; then
+        warn "Конфиг $file: владелец не root — игнорирую из соображений безопасности"
+        log "Конфиг отклонён (владелец не root): $file"
+        return 0
+    fi
+    if [ -n "$mode" ] && [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+        warn "Конфиг $file: права $mode шире 644 (запись для группы/остальных) — игнорирую"
+        log "Конфиг отклонён (небезопасные права $mode): $file"
+        return 0
+    fi
+
+    local line key value bad_keys=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"                                  # срезаем комментарий
+        line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -z "$line" ] && continue
+        case "$line" in
+            *=*) key="${line%%=*}"; value="${line#*=}" ;;
+            *) continue ;;
+        esac
+        key="$(echo "$key" | sed -e 's/[[:space:]]*$//')"
+        value="$(echo "$value" | sed -e 's/^[[:space:]]*//')"
+        value="${value%\"}"; value="${value#\"}"             # снимаем кавычки по краям
+        value="${value%\'}"; value="${value#\'}"
+
+        if ! config_key_allowed "$key"; then
+            warn "Конфиг $file: неизвестный ключ '$key' — пропущен"
+            bad_keys=$((bad_keys + 1))
+            continue
+        fi
+
+        case "$key" in
+            ASSUME_YES|REQUIRE_MD5|SKIP_RDP|ENABLE_REPORT|ENABLE_HISTORY)
+                case "$value" in
+                    true|false) printf -v "CFG_$key" '%s' "$value" ;;
+                    *) warn "Конфиг $file: $key=$value — ожидалось true/false, пропущено" ;;
+                esac
+                ;;
+            *) printf -v "CFG_$key" '%s' "$value" ;;
+        esac
+    done < "$file"
+
+    CONFIG_LOADED="$file"
+    log "Загружен конфиг $file (отклонено ключей: $bad_keys)"
+
+    # Применяем значения — только там, где источник с более высоким приоритетом молчал.
+    [ -z "${R7_LOG:-}" ]   && [ -n "$CFG_LOG_FILE" ]     && LOG_FILE="$CFG_LOG_FILE"
+    [ -z "${R7_STATE:-}" ] && [ -n "$CFG_STATE_DIR" ]    && STATE_DIR="$CFG_STATE_DIR"
+    if [ "$CMD_DIR_SET" != true ] && [ -z "${R7_DIR:-}" ] && [ -n "$CFG_DOWNLOAD_DIR" ]; then
+        DOWNLOAD_DIR="$CFG_DOWNLOAD_DIR"
+    fi
+    if [ "$CMD_YES_SET" != true ] && [ "$CFG_ASSUME_YES" = true ]; then
+        ASSUME_YES=true
+    fi
+    if [ "$CMD_CHECK" != true ] && [ -z "$CMD_MD5" ] && [ "$CFG_REQUIRE_MD5" = true ]; then
+        CMD_CHECK=true
+        log "Конфиг требует проверку целостности (REQUIRE_MD5=true)"
+    fi
 }
 
 header() {
@@ -162,6 +265,7 @@ show_help() {
       --os ИМЯ           Принудительный профиль ОС:
                          debian12 | debian13 | astra | alt | redos | rosa
       --dir ПУТЬ         Папка с пакетами (.deb/.rpm)
+      --config ПУТЬ      Свой конфиг вместо /etc/r7-installer.conf
       --dry-run          Показать команды, ничего не устанавливая
   -y, --yes              Не задавать вопросов (для автоматизации)
       --no-color         Вывод без цветов (для логов и CI)
@@ -179,6 +283,7 @@ show_help() {
 ФАЙЛЫ:
   Лог:       /var/log/r7-update.log
   Состояние: /var/lib/r7-installer/
+  Конфиг:    /etc/r7-installer.conf (необязательный, см. README)
 HELPEOF
 }
 
@@ -198,9 +303,10 @@ parse_args() {
             --health)       CMD_HEALTH=true; shift ;;
             --remove)       CMD_REMOVE=true; shift ;;
             --os)           CMD_FORCE_OS="${2:-}"; shift 2 ;;
-            --dir)          DOWNLOAD_DIR="${2:-}"; shift 2 ;;
+            --config)       CMD_CONFIG="${2:-}"; shift 2 ;;
+            --dir)          DOWNLOAD_DIR="${2:-}"; CMD_DIR_SET=true; shift 2 ;;
             --dry-run)      DRY_RUN=true; shift ;;
-            -y|--yes)       ASSUME_YES=true; shift ;;
+            -y|--yes)       ASSUME_YES=true; CMD_YES_SET=true; shift ;;
             --no-color)     NO_COLOR_MODE=true; shift ;;
             -h|--help)      CMD_HELP=true; shift ;;
             *)
@@ -1714,6 +1820,11 @@ health_check() {
     ok "$OS_PRETTY"
     ok "Профиль: $OS_ID | менеджер: $PM | формат: $PKG_FMT"
     check_os_version
+    if [ -n "$CONFIG_LOADED" ]; then
+        ok "Конфиг: $CONFIG_LOADED"
+    else
+        info "  Конфиг: не найден, используются умолчания"
+    fi
     echo ""
 
     echo -e "${BOLD}2. Р7-Офис${NC}"
@@ -2205,8 +2316,10 @@ main() {
     fi
 
     check_root "$@"
+    load_config
     init_log
     detect_os
+    [ "$CFG_SKIP_RDP" = true ] && FEAT_RDP=false
     detect_real_user
     detect_session_type
 
