@@ -60,7 +60,7 @@ sudo ./install-r7.sh --os astra -l
 **Альт Linux**
 
 ```bash
-cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null
+cd /home/admin/Загрузки 2>/dev/null || cd ~/Загрузки 2>/dev/null || cd ~/Downloads 2>/dev/null || cd ~
 curl -fsSLO https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh
 chmod +x install-r7.sh
 sudo ./install-r7.sh --os alt -l
