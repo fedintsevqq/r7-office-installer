@@ -52,6 +52,8 @@ CMD_RESTORE_IDLE=false
 CMD_VERIFY=false
 CMD_HISTORY=false
 CMD_HISTORY_N=10
+CMD_REPORT=false
+CMD_REPORT_MODE="open"
 DRY_RUN=false
 ASSUME_YES=false
 NO_COLOR_MODE=false
@@ -266,6 +268,9 @@ show_help() {
       --verify           Smoke-тест: реально ли соберутся зависимости
                          бинарника (ldd), без переустановки
       --history [N]      Последние N установок/удалений (по умолчанию 10)
+      --report           Открыть последний HTML-отчёт об установке
+      --report list      Список сохранённых отчётов
+      --report json      Последний отчёт в JSON — в stdout (для CI)
       --fix-wayland      Исправить проблемы запуска под Wayland (Debian 13 и др.)
       --remove           Меню удаления Р7-Офис
 
@@ -322,6 +327,13 @@ parse_args() {
                 case "${2:-}" in
                     ''|*[!0-9]*) shift ;;                       # без числа — умолчание
                     *)           CMD_HISTORY_N="$2"; shift 2 ;;
+                esac
+                ;;
+            --report)
+                CMD_REPORT=true
+                case "${2:-}" in
+                    list|json) CMD_REPORT_MODE="$2"; shift 2 ;;
+                    *)         shift ;;
                 esac
                 ;;
             --remove)       CMD_REMOVE=true; shift ;;
@@ -1951,6 +1963,7 @@ history_rotate() {
 # GPG_STATUS и LDD_STATUS берутся из глобальных переменных — их выставляют
 # check_package_signature() и smoke_test_ldd(), вызванные в install_package().
 history_write() {
+    [ "$DRY_RUN" = true ] && return 0   # --dry-run ничего не делал — незачем и записывать
     [ "$CFG_ENABLE_HISTORY" = false ] && return 0
     local action="$1" status="$2" package="$3" version="$4" md5="$5" md5_status="$6" duration="${7:-0}"
     local file; file="$(history_file)"
@@ -2021,6 +2034,186 @@ show_history() {
 }
 
 # ============================================================================
+#  HTML/JSON-ОТЧЁТ ОБ УСТАНОВКЕ
+#
+#  Самодостаточный HTML (CSS инлайном, без внешних запросов — машины
+#  бывают без интернета) плюс тот же результат в JSON рядом, для CI.
+# ============================================================================
+
+reports_dir() { echo "$STATE_DIR/reports"; }
+
+html_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    s="${s//\"/&quot;}"
+    printf '%s' "$s"
+}
+
+# generate_report KIND STATUS ПАКЕТ ВЕРСИЯ MD5_STATUS TOTAL_DUR DEPS_DUR PKG_DUR
+# GPG_STATUS/LDD_STATUS — из глобальных переменных (их выставляют
+# check_package_signature() и smoke_test_ldd() в install_package()).
+generate_report() {
+    [ "$DRY_RUN" = true ] && return 0   # --dry-run ничего не делал — незачем и записывать
+    [ "$CFG_ENABLE_REPORT" = false ] && return 0
+
+    local kind="$1" status="$2" package="$3" version="$4" md5_status="${5:-skipped}" \
+          total_dur="${6:-0}" deps_dur="${7:-0}" pkg_dur="${8:-0}"
+
+    local dir; dir="$(reports_dir)"
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        warn "Не удалось создать $dir — отчёт не сохранён"
+        return 0
+    fi
+
+    local stamp; stamp="$(date '+%Y%m%d_%H%M%S')"
+    local base="$dir/${kind}-${stamp}"
+    local html_file="${base}.html" json_file="${base}.json"
+    local ts; ts="$(date -Iseconds 2>/dev/null)"; [ -z "$ts" ] && ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+    # --- зависимости: что установлено, что пропущено ---
+    local dep_rows="" dep_ok=0 dep_missing=0 dkind dalts dchosen dstate dcls
+    while IFS='|' read -r dkind dalts; do
+        [ -z "$dkind" ] && continue
+        dchosen="$(pkg_pick "$dalts")"
+        if [ -n "$dchosen" ] && pkg_installed "$dchosen"; then
+            dep_ok=$((dep_ok + 1))
+            dstate="установлен"; dcls="ok"
+            dep_rows="${dep_rows}<tr><td>$(html_escape "$dchosen")</td><td class=\"$dcls\">$dstate</td></tr>"
+        else
+            dep_missing=$((dep_missing + 1))
+            dcls="miss"
+            [ "$dkind" = "req" ] && dstate="нет (обязательная)" || dstate="нет (необязательная)"
+            dep_rows="${dep_rows}<tr><td>$(html_escape "${dchosen:-$dalts}")</td><td class=\"$dcls\">$dstate</td></tr>"
+        fi
+    done < <(dep_spec)
+
+    local log_tail; log_tail="$(html_escape "$(tail -20 "$LOG_FILE" 2>/dev/null)")"
+
+    local status_ru status_color
+    case "$status" in
+        success) status_ru="успешно"; status_color="#2e7d32" ;;
+        failed)  status_ru="ошибка"; status_color="#c62828" ;;
+        *)       status_ru="$status"; status_color="#616161" ;;
+    esac
+
+    cat > "$html_file" <<HTMLEOF
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Р7-Офис — отчёт ${kind} ${stamp}</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#f5f7fa;color:#22252a;margin:0;padding:24px}
+  .card{max-width:820px;margin:0 auto;background:#fff;border-radius:12px;padding:24px 28px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  h1{font-size:20px;margin:0 0 4px}
+  .status{display:inline-block;padding:2px 10px;border-radius:8px;color:#fff;background:${status_color};font-size:13px}
+  table{width:100%;border-collapse:collapse;margin:8px 0 20px;font-size:14px}
+  td,th{padding:5px 8px;border-bottom:1px solid #eee;text-align:left}
+  td.ok{color:#2e7d32}
+  td.miss{color:#c62828}
+  pre{background:#22252a;color:#e6e6e6;padding:12px;border-radius:8px;overflow-x:auto;font-size:12px;line-height:1.5}
+  .sec{margin-top:22px}
+  .meta{color:#616161;font-size:13px}
+</style></head>
+<body><div class="card">
+  <h1>Р7-Офис — отчёт: ${kind}</h1>
+  <p class="meta">${ts} · <span class="status">${status_ru}</span></p>
+
+  <div class="sec">
+    <h3>Общая информация</h3>
+    <table>
+      <tr><th>ОС</th><td>$(html_escape "$OS_PRETTY")</td></tr>
+      <tr><th>Профиль</th><td>$(html_escape "$OS_ID") / $(html_escape "$PM") / $(html_escape "$PKG_FMT")</td></tr>
+      <tr><th>Пакет</th><td>$(html_escape "$package")</td></tr>
+      <tr><th>Версия</th><td>$(html_escape "$version")</td></tr>
+      <tr><th>Пользователь</th><td>$(html_escape "$REAL_USER")</td></tr>
+      <tr><th>Скрипт</th><td>v$(html_escape "$SCRIPT_VERSION")</td></tr>
+    </table>
+  </div>
+
+  <div class="sec">
+    <h3>Проверка целостности</h3>
+    <table>
+      <tr><th>MD5</th><td>$(html_escape "$md5_status")</td></tr>
+      <tr><th>Подпись пакета</th><td>$(html_escape "${GPG_STATUS:-skipped}")</td></tr>
+      <tr><th>Smoke-тест (ldd)</th><td>$(html_escape "${LDD_STATUS:-skipped}")</td></tr>
+    </table>
+  </div>
+
+  <div class="sec">
+    <h3>Время</h3>
+    <table>
+      <tr><th>Всего</th><td>${total_dur} сек</td></tr>
+      <tr><th>Зависимости</th><td>${deps_dur} сек</td></tr>
+      <tr><th>Установка пакета</th><td>${pkg_dur} сек</td></tr>
+    </table>
+  </div>
+
+  <div class="sec">
+    <h3>Зависимости (${dep_ok} на месте, ${dep_missing} нет)</h3>
+    <table>${dep_rows}</table>
+  </div>
+
+  <div class="sec">
+    <h3>Лог установки (последние 20 строк)</h3>
+    <pre>${log_tail}</pre>
+  </div>
+</div></body></html>
+HTMLEOF
+
+    printf '{"ts":"%s","kind":"%s","status":"%s","os_id":"%s","os_pretty":"%s","os_ver":"%s","package":"%s","version":"%s","md5_status":"%s","gpg_status":"%s","ldd_status":"%s","deps_ok":%s,"deps_missing":%s,"duration_sec":%s,"deps_duration_sec":%s,"package_duration_sec":%s,"user":"%s","script_version":"%s"}\n' \
+        "$(json_escape "$ts")" "$(json_escape "$kind")" "$(json_escape "$status")" \
+        "$(json_escape "$OS_ID")" "$(json_escape "$OS_PRETTY")" "$(json_escape "$OS_VER")" \
+        "$(json_escape "$package")" "$(json_escape "$version")" \
+        "$(json_escape "$md5_status")" "$(json_escape "${GPG_STATUS:-skipped}")" "$(json_escape "${LDD_STATUS:-skipped}")" \
+        "$dep_ok" "$dep_missing" "$total_dur" "$deps_dur" "$pkg_dur" \
+        "$(json_escape "$REAL_USER")" "$(json_escape "$SCRIPT_VERSION")" > "$json_file"
+
+    log "Отчёт сохранён: $html_file"
+    echo -e "${CYAN}📊 Отчёт сохранён:${NC} $html_file"
+}
+
+# Открыть последний отчёт — НЕ от root: браузер из-под sudo либо не
+# запустится, либо наплодит root-овых конфигов в чужом профиле.
+show_report() {
+    local mode="${1:-open}"
+    local dir; dir="$(reports_dir)"
+
+    if [ "$mode" = "list" ]; then
+        header
+        separator
+        echo -e "${BOLD}${WHITE}  ОТЧЁТЫ${NC}"
+        separator
+        if [ -d "$dir" ] && ls "$dir"/*.html >/dev/null 2>&1; then
+            ls -t "$dir"/*.html | sed 's/^/  /'
+        else
+            info "  Отчётов ещё нет"
+        fi
+        separator
+        return 0
+    fi
+
+    local last_html; last_html="$(ls -t "$dir"/*.html 2>/dev/null | head -1)"
+    if [ -z "$last_html" ]; then
+        info "Отчётов ещё нет — сначала выполните установку"
+        return 0
+    fi
+
+    if [ "$mode" = "json" ]; then
+        local last_json="${last_html%.html}.json"
+        [ -f "$last_json" ] && cat "$last_json" || warn "JSON рядом с $last_html не найден"
+        return 0
+    fi
+
+    ok "Последний отчёт: $last_html"
+    if [ "$(id -u)" -eq 0 ] && [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ] && command -v xdg-open >/dev/null 2>&1; then
+        run_as_user xdg-open "$last_html" >/dev/null 2>&1 &
+    else
+        info "  Откройте в браузере: $last_html"
+    fi
+}
+
+# ============================================================================
 #  УСТАНОВКА ПАКЕТА
 # ============================================================================
 
@@ -2034,6 +2227,7 @@ install_package() {
     [ -z "$version" ] && version="$(basename "$file")"
     local pkg_name; pkg_name="$(basename "$file")"
     local start_ts; start_ts="$(date +%s)"
+    local deps_dur=0 pkg_dur=0
     GPG_STATUS=""; LDD_STATUS=""     # на каждую установку — заново
 
     if [ ! -f "$file" ]; then
@@ -2043,7 +2237,9 @@ install_package() {
 
     if ! check_package_os_match "$file"; then
         info "Отменено пользователем"
-        history_write install cancelled "$pkg_name" "$version" "" "skipped" "$(( $(date +%s) - start_ts ))"
+        local dur=$(( $(date +%s) - start_ts ))
+        history_write install cancelled "$pkg_name" "$version" "" "skipped" "$dur"
+        generate_report install cancelled "$pkg_name" "$version" "skipped" "$dur" 0 0
         return 1
     fi
 
@@ -2062,7 +2258,9 @@ install_package() {
         else
             fail "Установка отменена: контрольная сумма не совпала"
             log "Установка отменена (MD5) для $file"
-            history_write install failed "$pkg_name" "$version" "$user_md5" "failed" "$(( $(date +%s) - start_ts ))"
+            local dur=$(( $(date +%s) - start_ts ))
+            history_write install failed "$pkg_name" "$version" "$user_md5" "failed" "$dur"
+            generate_report install failed "$pkg_name" "$version" "failed" "$dur" 0 0
             return 1
         fi
     fi
@@ -2072,13 +2270,17 @@ install_package() {
     if [ "$ASSUME_YES" != true ]; then
         if ! confirm "Продолжить установку?" "Y"; then
             info "Отменено пользователем"
-            history_write install cancelled "$pkg_name" "$version" "$user_md5" "$md5_status" "$(( $(date +%s) - start_ts ))"
+            local dur=$(( $(date +%s) - start_ts ))
+            history_write install cancelled "$pkg_name" "$version" "$user_md5" "$md5_status" "$dur"
+            generate_report install cancelled "$pkg_name" "$version" "$md5_status" "$dur" 0 0
             return 1
         fi
     fi
 
     # 3. Зависимости
+    local deps_start; deps_start="$(date +%s)"
     install_all_dependencies
+    deps_dur=$(( $(date +%s) - deps_start ))
 
     # 4. Закрыть работающий Р7
     ensure_r7_closed
@@ -2092,14 +2294,19 @@ install_package() {
 
     # 6. Установка
     step "Устанавливаем $version..."
+    local pkg_start; pkg_start="$(date +%s)"
     if install_pkg_file "$file"; then
+        pkg_dur=$(( $(date +%s) - pkg_start ))
         echo ""
         ok "УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО"
         log "Установлена версия $version из $(basename "$file")"
         post_install_actions   # тут же выставляет LDD_STATUS через smoke_test_ldd()
-        history_write install success "$pkg_name" "$version" "$user_md5" "$md5_status" "$(( $(date +%s) - start_ts ))"
+        local dur=$(( $(date +%s) - start_ts ))
+        history_write install success "$pkg_name" "$version" "$user_md5" "$md5_status" "$dur"
+        generate_report install success "$pkg_name" "$version" "$md5_status" "$dur" "$deps_dur" "$pkg_dur"
         return 0
     fi
+    pkg_dur=$(( $(date +%s) - pkg_start ))
 
     echo ""
     fail "ОШИБКА ПРИ УСТАНОВКЕ"
@@ -2107,7 +2314,9 @@ install_package() {
     echo -e "  ${CYAN}Последние строки лога:${NC}"
     tail -15 "$LOG_FILE" 2>/dev/null | sed 's/^/     /'
     log "Ошибка установки $(basename "$file")"
-    history_write install failed "$pkg_name" "$version" "$user_md5" "$md5_status" "$(( $(date +%s) - start_ts ))"
+    local dur=$(( $(date +%s) - start_ts ))
+    history_write install failed "$pkg_name" "$version" "$user_md5" "$md5_status" "$dur"
+    generate_report install failed "$pkg_name" "$version" "$md5_status" "$dur" "$deps_dur" "$pkg_dur"
     return 1
 }
 
@@ -2868,6 +3077,7 @@ main() {
         exit $?
     fi
     if [ "$CMD_HISTORY" = true ]; then show_history "$CMD_HISTORY_N"; exit 0; fi
+    if [ "$CMD_REPORT" = true ]; then show_report "$CMD_REPORT_MODE"; exit 0; fi
     if [ "$CMD_FIX_WAYLAND" = true ]; then fix_wayland; exit $?; fi
     if [ "$CMD_REMOVE" = true ];      then remove_r7_office; exit 0; fi
     if [ "$CMD_INSTALL_DEPS" = true ]; then
