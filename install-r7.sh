@@ -51,6 +51,8 @@ CMD_NO_IDLE=false
 CMD_RESTORE_IDLE=false
 CMD_VERIFY=false
 CMD_CHECK_DEPS=false
+CMD_UPGRADE=false
+CMD_UPGRADE_CHECK=false
 CMD_HISTORY=false
 CMD_HISTORY_N=10
 CMD_REPORT=false
@@ -315,6 +317,8 @@ show_help() {
       --report           Открыть последний HTML-отчёт об установке
       --report list      Список сохранённых отчётов
       --report json      Последний отчёт в JSON — в stdout (для CI)
+      --upgrade          Обновить сам install-r7.sh до последней версии
+      --upgrade-check    Только проверить, не заменяя файл
       --fix-wayland      Исправить проблемы запуска под Wayland (Debian 13 и др.)
       --remove           Меню удаления Р7-Офис
 
@@ -367,6 +371,8 @@ parse_args() {
             --health)       CMD_HEALTH=true; shift ;;
             --verify)       CMD_VERIFY=true; shift ;;
             --check-deps)   CMD_CHECK_DEPS=true; shift ;;
+            --upgrade)       CMD_UPGRADE=true; shift ;;
+            --upgrade-check) CMD_UPGRADE_CHECK=true; shift ;;
             --history)
                 CMD_HISTORY=true
                 case "${2:-}" in
@@ -2401,6 +2407,175 @@ show_report() {
 }
 
 # ============================================================================
+#  САМООБНОВЛЕНИЕ (--upgrade / --upgrade-check)
+#
+#  Опасность в лоб: bash читает исполняемый скрипт порциями по мере
+#  выполнения. Переписать файл В МЕСТЕ (truncate + новое содержимое)
+#  во время работы того же процесса — верный способ дочитать мусор
+#  сдвинутыми смещениями. Поэтому замена — ТОЛЬКО через mv (rename):
+#  на POSIX-файловых системах rename не трогает уже открытый читающий
+#  файловый дескриптор, у текущего процесса как был, так и остаётся
+#  доступ к прежнему содержимому старого инода до его завершения.
+#  Именно поэтому mv, а не `cat новый > $0` и не dd/rsync --inplace.
+#
+#  Порядок: скачать во временный файл → bash -n → маркеры → бэкап →
+#  mv → немедленный exit. Никакого продолжения работы после замены —
+#  это уже подстраховка сверху атомарности mv, а не единственная защита.
+# ============================================================================
+
+UPGRADE_TMP_FILE=""
+UPGRADE_REMOTE_VERSION=""
+
+resolve_upgrade_url() {
+    if [ -n "$CFG_UPGRADE_URL" ]; then
+        echo "$CFG_UPGRADE_URL"
+    else
+        echo "https://raw.githubusercontent.com/fedintsevqq/r7-office-installer/main/install-r7.sh"
+    fi
+}
+
+# Лояльный парсер под чужой (не наш) JSON — GitHub API пишет с пробелом
+# после двоеточия, наш собственный json_str_field() на это не рассчитан.
+gh_json_field() {
+    local json="$1" key="$2"
+    echo "$json" | grep -oE "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 \
+        | sed -E "s/^\"$key\"[[:space:]]*:[[:space:]]*\"//; s/\"\$//"
+}
+
+show_upgrade_changelog() {
+    local url="https://api.github.com/repos/fedintsevqq/r7-office-installer/releases/latest"
+    local tmp; tmp="$(mktemp 2>/dev/null)" || return 0
+    download_file "$url" "$tmp" || { rm -f "$tmp"; return 0; }
+    local json; json="$(cat "$tmp" 2>/dev/null)"
+    rm -f "$tmp"
+    [ -z "$json" ] && return 0
+
+    local tag body
+    tag="$(gh_json_field "$json" tag_name)"
+    body="$(gh_json_field "$json" body)"
+
+    [ -n "$tag" ] && info "Последний релиз на GitHub: $tag"
+    if [ -n "$body" ]; then
+        echo ""
+        echo -e "${CYAN}Changelog:${NC}"
+        # \r\n и \n в JSON-строке — экранированные литералы, не настоящие переводы строк
+        echo "$body" | sed -E 's/\\r\\n/\n/g; s/\\n/\n/g; s/\\"/"/g' | sed 's/^/  /'
+        echo ""
+    else
+        info "Полный список изменений: https://github.com/fedintsevqq/r7-office-installer/releases"
+    fi
+}
+
+# Скачать кандидата и проверить его перед тем, как доверять версии внутри.
+# Заполняет UPGRADE_TMP_FILE / UPGRADE_REMOTE_VERSION при успехе.
+check_for_upgrade() {
+    UPGRADE_TMP_FILE=""; UPGRADE_REMOTE_VERSION=""
+    local url; url="$(resolve_upgrade_url)"
+    step "Проверяем обновления ($url)..."
+
+    local tmp; tmp="$(mktemp /tmp/r7-upgrade.XXXXXX 2>/dev/null)" || tmp="$(mktemp)"
+    if ! download_file "$url" "$tmp"; then
+        fail "Не удалось скачать install-r7.sh для проверки версии"
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! bash -n "$tmp" 2>/dev/null; then
+        fail "Скачанный файл не проходит проверку синтаксиса (bash -n) — обновление отменено"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! head -1 "$tmp" | grep -q '^#!.*bash'; then
+        fail "Нет ожидаемого шебанга — файл не похож на install-r7.sh"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! grep -q '^SCRIPT_VERSION=' "$tmp" || ! grep -q '^main()' "$tmp" || ! grep -q '^detect_os()' "$tmp"; then
+        fail "Не найдены ожидаемые маркеры (SCRIPT_VERSION/main/detect_os) — файл не похож на install-r7.sh"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    local remote_ver
+    remote_ver="$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | sed -E 's/^SCRIPT_VERSION="?([^"]*)"?.*/\1/')"
+    if [ -z "$remote_ver" ]; then
+        fail "Не удалось прочитать версию в скачанном файле"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    UPGRADE_TMP_FILE="$tmp"
+    UPGRADE_REMOTE_VERSION="$remote_ver"
+    return 0
+}
+
+cmd_upgrade_check() {
+    check_for_upgrade || return 1
+    if ver_ge "$SCRIPT_VERSION" "$UPGRADE_REMOTE_VERSION"; then
+        ok "У вас последняя версия: $SCRIPT_VERSION"
+    else
+        warn "Доступна новая версия: $UPGRADE_REMOTE_VERSION (у вас $SCRIPT_VERSION)"
+        show_upgrade_changelog
+        info "Обновить: sudo $SCRIPT_NAME --upgrade"
+    fi
+    rm -f "$UPGRADE_TMP_FILE"
+}
+
+cmd_upgrade() {
+    check_for_upgrade || return 1
+
+    if ver_ge "$SCRIPT_VERSION" "$UPGRADE_REMOTE_VERSION"; then
+        ok "У вас уже последняя версия: $SCRIPT_VERSION"
+        rm -f "$UPGRADE_TMP_FILE"
+        return 0
+    fi
+
+    warn "Доступна новая версия: $UPGRADE_REMOTE_VERSION (у вас $SCRIPT_VERSION)"
+    show_upgrade_changelog
+
+    if [ "$ASSUME_YES" != true ]; then
+        if ! confirm "Обновить сейчас?" "Y"; then
+            info "Отменено"
+            rm -f "$UPGRADE_TMP_FILE"
+            return 1
+        fi
+    fi
+
+    local self="$SCRIPT_DIR/$SCRIPT_NAME"
+    if [ ! -w "$self" ] && [ ! -w "$SCRIPT_DIR" ]; then
+        fail "Нет прав на запись в $self"
+        rm -f "$UPGRADE_TMP_FILE"
+        return 1
+    fi
+
+    local backup_dir="$STATE_DIR/backups"
+    mkdir -p "$backup_dir" 2>/dev/null
+    local backup_file="$backup_dir/install-r7-${SCRIPT_VERSION}-$(date '+%Y%m%d_%H%M%S').sh"
+    if ! cp "$self" "$backup_file" 2>/dev/null; then
+        fail "Не удалось сохранить резервную копию — обновление отменено"
+        rm -f "$UPGRADE_TMP_FILE"
+        return 1
+    fi
+    ok "Резервная копия: $backup_file"
+
+    chmod --reference="$self" "$UPGRADE_TMP_FILE" 2>/dev/null || chmod 755 "$UPGRADE_TMP_FILE"
+    if ! mv "$UPGRADE_TMP_FILE" "$self"; then
+        fail "Не удалось заменить файл — текущий скрипт не тронут, бэкап на месте: $backup_file"
+        rm -f "$UPGRADE_TMP_FILE" 2>/dev/null
+        return 1
+    fi
+
+    log "Скрипт обновлён: $SCRIPT_VERSION -> $UPGRADE_REMOTE_VERSION"
+    ok "Обновлено до версии $UPGRADE_REMOTE_VERSION"
+    info "Запустите заново: sudo $self"
+    exit 0
+}
+
+# ============================================================================
 #  УСТАНОВКА ПАКЕТА
 # ============================================================================
 
@@ -3266,6 +3441,8 @@ main() {
     fi
     if [ "$CMD_HISTORY" = true ]; then show_history "$CMD_HISTORY_N"; exit 0; fi
     if [ "$CMD_REPORT" = true ]; then show_report "$CMD_REPORT_MODE"; exit 0; fi
+    if [ "$CMD_UPGRADE_CHECK" = true ]; then cmd_upgrade_check; exit $?; fi
+    if [ "$CMD_UPGRADE" = true ]; then cmd_upgrade; exit $?; fi
     if [ "$CMD_FIX_WAYLAND" = true ]; then fix_wayland; exit $?; fi
     if [ "$CMD_REMOVE" = true ];      then remove_r7_office; exit 0; fi
     if [ "$CMD_INSTALL_DEPS" = true ]; then
