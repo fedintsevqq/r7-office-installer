@@ -50,6 +50,8 @@ CMD_CONFIG=""
 CMD_NO_IDLE=false
 CMD_RESTORE_IDLE=false
 CMD_VERIFY=false
+CMD_HISTORY=false
+CMD_HISTORY_N=10
 DRY_RUN=false
 ASSUME_YES=false
 NO_COLOR_MODE=false
@@ -263,6 +265,7 @@ show_help() {
       --health           Диагностика системы (health-check)
       --verify           Smoke-тест: реально ли соберутся зависимости
                          бинарника (ldd), без переустановки
+      --history [N]      Последние N установок/удалений (по умолчанию 10)
       --fix-wayland      Исправить проблемы запуска под Wayland (Debian 13 и др.)
       --remove           Меню удаления Р7-Офис
 
@@ -314,6 +317,13 @@ parse_args() {
             --fix-wayland)  CMD_FIX_WAYLAND=true; shift ;;
             --health)       CMD_HEALTH=true; shift ;;
             --verify)       CMD_VERIFY=true; shift ;;
+            --history)
+                CMD_HISTORY=true
+                case "${2:-}" in
+                    ''|*[!0-9]*) shift ;;                       # без числа — умолчание
+                    *)           CMD_HISTORY_N="$2"; shift 2 ;;
+                esac
+                ;;
             --remove)       CMD_REMOVE=true; shift ;;
             --os)           CMD_FORCE_OS="${2:-}"; shift 2 ;;
             --config)       CMD_CONFIG="${2:-}"; shift 2 ;;
@@ -1834,6 +1844,183 @@ check_package_os_match() {
 }
 
 # ============================================================================
+#  ПОДПИСЬ ПАКЕТА
+#
+#  MD5 из документа Word (check_checksum) защищает от битой закачки, но не
+#  подтверждает, что пакет вообще пришёл от Р7. Где есть штатный
+#  инструмент проверки подписи — используем его. Не блокируем установку
+#  при отсутствии подписи: у .deb в этом проекте её просто обычно нет
+#  (это не то же самое, что подпись Release-файла репозитория apt), а
+#  среди тестовых сборок попадаются и неподписанные .rpm.
+# ============================================================================
+
+GPG_STATUS=""   # "" | passed | unsigned | failed | skipped — читают история и отчёт
+
+check_package_signature() {
+    local file="$1"
+    case "$PKG_FMT" in
+        rpm)
+            if ! command -v rpm >/dev/null 2>&1; then
+                GPG_STATUS="skipped"; return 0
+            fi
+            local out; out="$(rpm -K "$file" 2>&1)"
+            case "$out" in
+                *"signatures OK"*|*"pgp"*"OK"*|*"gpg"*"OK"*)
+                    GPG_STATUS="passed"
+                    ok "Подпись пакета: действительна"
+                    ;;
+                *"digests OK"*)
+                    GPG_STATUS="unsigned"
+                    info "  Подпись пакета: не подписан (контрольные суммы внутри пакета в порядке)"
+                    ;;
+                *)
+                    GPG_STATUS="failed"
+                    warn "Подпись пакета: не удалось подтвердить ($out)"
+                    ;;
+            esac
+            log "Проверка подписи ($file): $out"
+            ;;
+        deb)
+            if command -v dpkg-sig >/dev/null 2>&1; then
+                local out; out="$(dpkg-sig --verify "$file" 2>&1)"
+                if echo "$out" | grep -q "GOODSIG"; then
+                    GPG_STATUS="passed"
+                    ok "Подпись пакета: действительна"
+                elif echo "$out" | grep -qi "no signature"; then
+                    GPG_STATUS="unsigned"
+                else
+                    GPG_STATUS="failed"
+                    warn "Подпись пакета: не удалось подтвердить ($out)"
+                fi
+                log "Проверка подписи ($file): $out"
+            else
+                # dpkg-sig почти нигде не стоит по умолчанию, а у .deb-пакетов
+                # обычно и нет подписи на уровне отдельного файла — это
+                # не ошибка проекта, честно помечаем как "не проверялось".
+                GPG_STATUS="skipped"
+            fi
+            ;;
+        *) GPG_STATUS="skipped" ;;
+    esac
+}
+
+# ============================================================================
+#  ИСТОРИЯ УСТАНОВОК (JSON Lines)
+#
+#  Одна строка — один JSON-объект. Специально не JSON-массив: чтобы
+#  дописать запись в массив, пришлось бы перечитывать и переписывать
+#  весь файл, а оборванная на середине запись сломала бы разбор целиком.
+#  JSON Lines дописывается через >> и читается построчно — то, что нужно
+#  для append-only лога.
+#
+#  Разбор — без jq/python (их может не быть в системе), свой парсер под
+#  наш же формат: каждое строковое значение — "ключ":"значение" без
+#  вложенных объектов, поэтому grep -oE + sed достаточно.
+# ============================================================================
+
+history_file() { echo "$STATE_DIR/history.log"; }
+
+# Экранирование строки для встраивания в JSON-значение
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/}"
+    printf '%s' "$s"
+}
+
+json_str_field() {
+    echo "$1" | grep -oE "\"$2\":\"[^\"]*\"" | head -1 | sed -E "s/^\"$2\":\"//; s/\"\$//"
+}
+
+json_num_field() {
+    echo "$1" | grep -oE "\"$2\":[0-9]+" | head -1 | sed -E "s/^\"$2\"://"
+}
+
+history_rotate() {
+    local file="$1" max=1000 n
+    n="$(wc -l < "$file" 2>/dev/null || echo 0)"
+    if [ "$n" -gt "$max" ] 2>/dev/null; then
+        tail -n "$max" "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
+    fi
+}
+
+# history_write ACTION STATUS ПАКЕТ ВЕРСИЯ MD5 MD5_STATUS DURATION_SEC
+# GPG_STATUS и LDD_STATUS берутся из глобальных переменных — их выставляют
+# check_package_signature() и smoke_test_ldd(), вызванные в install_package().
+history_write() {
+    [ "$CFG_ENABLE_HISTORY" = false ] && return 0
+    local action="$1" status="$2" package="$3" version="$4" md5="$5" md5_status="$6" duration="${7:-0}"
+    local file; file="$(history_file)"
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    if ! : >> "$file" 2>/dev/null; then
+        warn "Не удалось записать историю в $file"
+        return 0
+    fi
+
+    local ts; ts="$(date -Iseconds 2>/dev/null)"
+    [ -z "$ts" ] && ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+    printf '{"ts":"%s","action":"%s","os_id":"%s","os_pretty":"%s","os_ver":"%s","pkg_fmt":"%s","pm":"%s","package":"%s","version":"%s","md5":"%s","md5_status":"%s","gpg_status":"%s","ldd_status":"%s","status":"%s","user":"%s","script_version":"%s","duration_sec":%s}\n' \
+        "$(json_escape "$ts")" "$(json_escape "$action")" \
+        "$(json_escape "$OS_ID")" "$(json_escape "$OS_PRETTY")" "$(json_escape "$OS_VER")" \
+        "$(json_escape "$PKG_FMT")" "$(json_escape "$PM")" \
+        "$(json_escape "$package")" "$(json_escape "$version")" \
+        "$(json_escape "$md5")" "$(json_escape "$md5_status")" \
+        "$(json_escape "${GPG_STATUS:-skipped}")" "$(json_escape "${LDD_STATUS:-skipped}")" \
+        "$(json_escape "$status")" "$(json_escape "$REAL_USER")" \
+        "$(json_escape "$SCRIPT_VERSION")" "${duration:-0}" >> "$file"
+
+    history_rotate "$file"
+    log "История ($action): $package -> $status"
+}
+
+history_print_entry() {
+    local line="$1" ts action os_pretty version status duration user md5_status gpg_status ldd_status
+    ts="$(json_str_field "$line" ts)"
+    action="$(json_str_field "$line" action)"
+    os_pretty="$(json_str_field "$line" os_pretty)"
+    version="$(json_str_field "$line" version)"
+    status="$(json_str_field "$line" status)"
+    duration="$(json_num_field "$line" duration_sec)"
+    user="$(json_str_field "$line" user)"
+    md5_status="$(json_str_field "$line" md5_status)"
+    gpg_status="$(json_str_field "$line" gpg_status)"
+    ldd_status="$(json_str_field "$line" ldd_status)"
+
+    local mark="${GREEN}✅${NC}"
+    [ "$status" = "failed" ] && mark="${RED}❌${NC}"
+    [ "$status" = "cancelled" ] && mark="${YELLOW}⚠️ ${NC}"
+
+    echo -e "  $mark ${BOLD}$ts${NC}  $action  $version  ${CYAN}($status)${NC}"
+    echo -e "     ОС: $os_pretty  |  пользователь: $user  |  ${duration:-0} сек"
+    echo -e "     MD5: ${md5_status:-—}   GPG: ${gpg_status:-—}   ldd: ${ldd_status:-—}"
+    echo ""
+}
+
+show_history() {
+    local n="${1:-10}"
+    local file; file="$(history_file)"
+    header
+    separator
+    echo -e "${BOLD}${WHITE}  ИСТОРИЯ УСТАНОВОК (последние $n)${NC}"
+    separator
+    echo ""
+    if [ ! -f "$file" ] || [ ! -s "$file" ]; then
+        info "  История пуста — установок ещё не было"
+        separator
+        return 0
+    fi
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && history_print_entry "$line"
+    done < <(tail -n "$n" "$file")
+    separator
+}
+
+# ============================================================================
 #  УСТАНОВКА ПАКЕТА
 # ============================================================================
 
@@ -1845,6 +2032,9 @@ install_package() {
     esac
     local version; version="$(extract_version "$file")"
     [ -z "$version" ] && version="$(basename "$file")"
+    local pkg_name; pkg_name="$(basename "$file")"
+    local start_ts; start_ts="$(date +%s)"
+    GPG_STATUS=""; LDD_STATUS=""     # на каждую установку — заново
 
     if [ ! -f "$file" ]; then
         fail "Файл не найден: $file"
@@ -1853,6 +2043,7 @@ install_package() {
 
     if ! check_package_os_match "$file"; then
         info "Отменено пользователем"
+        history_write install cancelled "$pkg_name" "$version" "" "skipped" "$(( $(date +%s) - start_ts ))"
         return 1
     fi
 
@@ -1861,11 +2052,17 @@ install_package() {
     echo -e "${BOLD}${BLUE}  УСТАНОВКА: $version${NC}"
     separator
 
+    check_package_signature "$file"
+
     # 1. Контрольная сумма
+    local md5_status="skipped"
     if [ "$CMD_CHECK" = true ] || [ -n "$user_md5" ] || [ -f "${file}.md5" ] || [ -f "${file}.sha256" ]; then
-        if ! check_checksum "$file" "$user_md5"; then
+        if check_checksum "$file" "$user_md5"; then
+            md5_status="passed"
+        else
             fail "Установка отменена: контрольная сумма не совпала"
             log "Установка отменена (MD5) для $file"
+            history_write install failed "$pkg_name" "$version" "$user_md5" "failed" "$(( $(date +%s) - start_ts ))"
             return 1
         fi
     fi
@@ -1873,7 +2070,11 @@ install_package() {
     # 2. Информация и подтверждение
     show_package_info "$file"
     if [ "$ASSUME_YES" != true ]; then
-        confirm "Продолжить установку?" "Y" || { info "Отменено пользователем"; return 1; }
+        if ! confirm "Продолжить установку?" "Y"; then
+            info "Отменено пользователем"
+            history_write install cancelled "$pkg_name" "$version" "$user_md5" "$md5_status" "$(( $(date +%s) - start_ts ))"
+            return 1
+        fi
     fi
 
     # 3. Зависимости
@@ -1895,7 +2096,8 @@ install_package() {
         echo ""
         ok "УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО"
         log "Установлена версия $version из $(basename "$file")"
-        post_install_actions
+        post_install_actions   # тут же выставляет LDD_STATUS через smoke_test_ldd()
+        history_write install success "$pkg_name" "$version" "$user_md5" "$md5_status" "$(( $(date +%s) - start_ts ))"
         return 0
     fi
 
@@ -1905,6 +2107,7 @@ install_package() {
     echo -e "  ${CYAN}Последние строки лога:${NC}"
     tail -15 "$LOG_FILE" 2>/dev/null | sed 's/^/     /'
     log "Ошибка установки $(basename "$file")"
+    history_write install failed "$pkg_name" "$version" "$user_md5" "$md5_status" "$(( $(date +%s) - start_ts ))"
     return 1
 }
 
@@ -2038,7 +2241,8 @@ remove_r7_office() {
         return 0
     fi
 
-    info "Установленная версия: $(installed_version)"
+    local removed_version; removed_version="$(installed_version)"
+    info "Установленная версия: $removed_version"
     echo ""
     echo -e "  ${BLUE}[1]${NC} Удалить программу, ${GREEN}оставить${NC} кэш и настройки"
     echo -e "  ${BLUE}[2]${NC} Удалить программу и ${YELLOW}очистить кэш${NC}, настройки оставить"
@@ -2048,12 +2252,16 @@ remove_r7_office() {
     echo -n -e "${BOLD}Ваш выбор (1-4): ${NC}"
     read -r choice
 
+    local start_ts; start_ts="$(date +%s)"
+    GPG_STATUS="skipped"; LDD_STATUS="skipped"   # неприменимо к удалению
+
     case "$choice" in
         1)
             ensure_r7_closed
             pm_remove "$PKG_NAME"
             ok "Программа удалена, данные пользователя на месте"
             log "Удалён Р7 (вариант 1)"
+            history_write remove success "$PKG_NAME" "$removed_version" "" "skipped" "$(( $(date +%s) - start_ts ))"
             ;;
         2)
             ensure_r7_closed
@@ -2064,6 +2272,7 @@ remove_r7_office() {
             done < <(cache_dirs)
             ok "Программа удалена, кэш очищен"
             log "Удалён Р7 (вариант 2)"
+            history_write remove success "$PKG_NAME" "$removed_version" "" "skipped" "$(( $(date +%s) - start_ts ))"
             ;;
         3)
             echo ""
@@ -2085,6 +2294,7 @@ remove_r7_office() {
             rm -f  "$(deps_flag_file)" 2>/dev/null
             ok "Полное удаление завершено"
             log "Удалён Р7 (вариант 3, полностью)"
+            history_write remove success "$PKG_NAME" "$removed_version" "" "skipped" "$(( $(date +%s) - start_ts ))"
             ;;
         *)
             info "Отменено"
@@ -2657,6 +2867,7 @@ main() {
         smoke_test_ldd
         exit $?
     fi
+    if [ "$CMD_HISTORY" = true ]; then show_history "$CMD_HISTORY_N"; exit 0; fi
     if [ "$CMD_FIX_WAYLAND" = true ]; then fix_wayland; exit $?; fi
     if [ "$CMD_REMOVE" = true ];      then remove_r7_office; exit 0; fi
     if [ "$CMD_INSTALL_DEPS" = true ]; then
