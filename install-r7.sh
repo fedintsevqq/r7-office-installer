@@ -3,7 +3,7 @@
 #  Р7-ОФИС — УНИВЕРСАЛЬНЫЙ УСТАНОВЩИК
 #  Поддержка: Debian 12/13, Astra Linux 1.7+, Альт Linux 10+/11+,
 #             РЕД ОС 7.3+/8+, РОСА «ХРОМ» 12.4+
-#  Версия: 2.1
+#  Версия: 2.2
 #
 #  Запуск:   sudo ./install-r7.sh            (интерактивное меню)
 #            sudo ./install-r7.sh --help     (все опции)
@@ -11,7 +11,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.2"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -351,6 +351,8 @@ show_help() {
   Лог:       /var/log/r7-update.log
   Состояние: /var/lib/r7-installer/
   Конфиг:    /etc/r7-installer.conf (необязательный, см. README)
+  История:   /var/lib/r7-installer/history.log (JSON Lines)
+  Отчёты:    /var/lib/r7-installer/reports/*.html и *.json
   Простой:   /var/lib/r7-installer/idle-saved.state (временный, до восстановления)
 HELPEOF
 }
